@@ -712,7 +712,7 @@ class ColorAlphaSplitter {
 			in vec2 a_position;
 			in vec2 a_texCoord;
 			out vec2 v_texCoord;
-			
+
 			void main() {
 				gl_Position = vec4(a_position, 0.0, 1.0);
 				v_texCoord = a_texCoord;
@@ -726,11 +726,11 @@ class ColorAlphaSplitter {
 		// This shader is simple, simply copy the color information while setting alpha to 1
 		const fragmentShader = this.createShader(this.gl.FRAGMENT_SHADER, `#version 300 es
 			precision highp float;
-			
+
 			uniform sampler2D u_sourceTexture;
 			in vec2 v_texCoord;
 			out vec4 fragColor;
-			
+
 			void main() {
 				vec4 source = texture(u_sourceTexture, v_texCoord);
 				fragColor = vec4(source.rgb, 1.0);
@@ -756,7 +756,7 @@ class ColorAlphaSplitter {
 		// GPU since we're already calling it anyway.
 		const fragmentShader = this.createShader(this.gl.FRAGMENT_SHADER, `#version 300 es
 			precision highp float;
-			
+
 			uniform sampler2D u_sourceTexture;
 			uniform vec2 u_resolution; // The width and height of the canvas
 			in vec2 v_texCoord;
@@ -773,10 +773,10 @@ class ColorAlphaSplitter {
 					// This byte is in the luma plane. Find the corresponding pixel coordinates to sample from
 					float y = floor(byteOffset / width);
 					float x = mod(byteOffset, width);
-					
+
 					// Add 0.5 to sample the center of the texel
 					vec2 sampleCoord = (vec2(x, y) + 0.5) / u_resolution;
-					
+
 					// The luma value is the alpha from the source texture
 					return texture(u_sourceTexture, sampleCoord).a;
 				} else {
@@ -784,7 +784,7 @@ class ColorAlphaSplitter {
 					return 128.0 / 255.0;
 				}
 			}
-			
+
 			void main() {
 				// Each fragment writes 4 bytes (R, G, B, A)
 				float pixelIndex = floor(gl_FragCoord.y) * u_resolution.x + floor(gl_FragCoord.x);
@@ -795,7 +795,7 @@ class ColorAlphaSplitter {
 					float currentByteOffset = baseByteOffset + float(i);
 					result[i] = getByteValue(currentByteOffset);
 				}
-				
+
 				fragColor = result;
 			}
 		`);

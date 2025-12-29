@@ -215,6 +215,8 @@ type FragmentTrackData = {
 		sampleIndex: number;
 	}[];
 	startTimestampIsFinal: boolean;
+	/** Accumulated decode timestamp for multi-trun support. This tracks the DTS after all samples. */
+	accumulatedDecodeTimestamp: number;
 };
 
 type FragmentTrackSample = {
@@ -1880,11 +1882,6 @@ export class IsobmffDemuxer extends Demuxer {
 				assert(this.currentFragment);
 				assert(track.currentFragmentState);
 
-				if (this.currentFragment.trackData.has(track.id)) {
-					console.warn('Can\'t have two trun boxes for the same track in one fragment. Ignoring...');
-					break;
-				}
-
 				const version = readU8(slice);
 
 				const flags = readU24Be(slice);
@@ -1914,18 +1911,29 @@ export class IsobmffDemuxer extends Demuxer {
 					break;
 				}
 
-				let currentTimestamp = 0;
+				// Check if we already have track data for this track (multiple trun boxes)
+				let trackData = this.currentFragment.trackData.get(track.id);
+				// currentDecodeTimestamp is the DTS (decode timestamp), which advances by sampleDuration.
+				// This is separate from PTS (presentation timestamp) which includes composition time offset.
+				let currentDecodeTimestamp = 0;
 
-				const trackData: FragmentTrackData = {
-					track,
-					startTimestamp: 0,
-					endTimestamp: 0,
-					firstKeyFrameTimestamp: null,
-					samples: [],
-					presentationTimestamps: [],
-					startTimestampIsFinal: false,
-				};
-				this.currentFragment.trackData.set(track.id, trackData);
+				if (trackData) {
+					// Multiple trun boxes for the same track - continue from where we left off
+					currentDecodeTimestamp = trackData.accumulatedDecodeTimestamp;
+				} else {
+					// Create new track data
+					trackData = {
+						track,
+						startTimestamp: 0,
+						endTimestamp: 0,
+						firstKeyFrameTimestamp: null,
+						samples: [],
+						presentationTimestamps: [],
+						startTimestampIsFinal: false,
+						accumulatedDecodeTimestamp: 0,
+					};
+					this.currentFragment.trackData.set(track.id, trackData);
+				}
 
 				for (let i = 0; i < sampleCount; i++) {
 					let sampleDuration: number;
@@ -1967,7 +1975,7 @@ export class IsobmffDemuxer extends Demuxer {
 					const isKeyFrame = !(sampleFlags & 0x00010000);
 
 					trackData.samples.push({
-						presentationTimestamp: currentTimestamp + sampleCompositionTimeOffset,
+						presentationTimestamp: currentDecodeTimestamp + sampleCompositionTimeOffset,
 						duration: sampleDuration,
 						byteOffset: currentOffset,
 						byteSize: sampleSize,
@@ -1975,8 +1983,11 @@ export class IsobmffDemuxer extends Demuxer {
 					});
 
 					currentOffset += sampleSize;
-					currentTimestamp += sampleDuration;
+					currentDecodeTimestamp += sampleDuration;
 				}
+
+				// Store the accumulated DTS for the next trun box (if any)
+				trackData.accumulatedDecodeTimestamp = currentDecodeTimestamp;
 
 				trackData.presentationTimestamps = trackData.samples
 					.map((x, i) => ({ presentationTimestamp: x.presentationTimestamp, sampleIndex: i }))

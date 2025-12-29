@@ -99,16 +99,8 @@ export {
 	StreamTargetOptions,
 	StreamTargetChunk,
 } from './target';
-export {
-	AnyIterable,
-	MaybePromise,
-	Rotation,
-	SetRequired,
-} from './misc';
-export {
-	TrackType,
-	ALL_TRACK_TYPES,
-} from './output';
+export { AnyIterable, MaybePromise, Rotation, SetRequired } from './misc';
+export { TrackType, ALL_TRACK_TYPES } from './output';
 export {
 	Source,
 	BlobSource,
@@ -146,22 +138,14 @@ export {
 	WEBM,
 	FLAC,
 } from './input-format';
-export {
-	Input,
-	InputOptions,
-	InputDisposedError,
-} from './input';
+export { Input, InputOptions, InputDisposedError } from './input';
 export {
 	InputTrack,
 	InputVideoTrack,
 	InputAudioTrack,
 	PacketStats,
 } from './input-track';
-export {
-	EncodedPacket,
-	EncodedPacketSideData,
-	PacketType,
-} from './packet';
+export { EncodedPacket, EncodedPacketSideData, PacketType } from './packet';
 export {
 	AudioSample,
 	AudioSampleInit,
@@ -207,5 +191,45 @@ export {
 	AttachedFile,
 	TrackDisposition,
 } from './metadata';
+export {
+	HlsOutputFormat,
+	HlsOutputFormatOptions,
+	HlsTarget,
+	HlsBufferTarget,
+	HlsCallbackTarget,
+	HlsCallbackTargetOptions,
+	HlsFileSystemTarget,
+	HlsFileSystemTargetOptions,
+	HlsInputFormat,
+	HLS_INPUT,
+	HlsSource,
+	HlsSourceOptions,
+	HlsQualitySelection,
+	HlsQualitySelectionByBandwidth,
+	HlsQualitySelectionByResolution,
+	HlsResolvedStream,
+	HlsVirtualSource,
+	HlsVirtualSourceOptions,
+	createHlsVirtualSource,
+	HlsSegmentInfo,
+	parsePlaylist,
+	parseMasterPlaylist,
+	parseMediaPlaylist,
+	M3U8ParseError,
+	writePlaylist,
+	writeMasterPlaylist,
+	writeMediaPlaylist,
+	Playlist,
+	MasterPlaylist,
+	MediaPlaylist,
+	VariantStream,
+	MediaRendition,
+	MediaSegment,
+	InitSegment,
+	EncryptionKey,
+	DateRange,
+	SessionDataItem,
+	ByteRange,
+} from './hls/index';
 
 // 🐡🦔
