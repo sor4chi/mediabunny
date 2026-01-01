@@ -291,6 +291,89 @@ export class IsobmffDemuxer extends Demuxer {
 		return this.metadataTags;
 	}
 
+	/**
+	 * Normalizes timestamps so the stream starts at 0 seconds. This is useful for HLS streams
+	 * where the baseMediaDecodeTime in segments may be non-zero.
+	 *
+	 * Must be called after readMetadata() and after at least the first fragment has been parsed.
+	 *
+	 * @internal
+	 */
+	async normalizeStartTimestamp(): Promise<void> {
+		await this.readMetadata();
+
+		// Get the minimum first timestamp across all tracks
+		const inputTracks = this.tracks.map(track => track.inputTrack!);
+		const firstTimestamps = await Promise.all(
+			inputTracks.map(async (track) => {
+				const firstPacket = await track._backing.getFirstPacket({ metadataOnly: true });
+				return firstPacket?.timestamp ?? Infinity;
+			}),
+		);
+
+		const minFirstTimestamp = Math.min(...firstTimestamps);
+		if (minFirstTimestamp === Infinity || minFirstTimestamp === 0) {
+			// No packets found or already at 0, nothing to normalize
+			return;
+		}
+
+		// Adjust editListOffset on each track to shift timestamps back to 0
+		for (const track of this.tracks) {
+			// The editListOffset is added in mapTimestampIntoTimescale and subtracted when
+			// computing packet timestamps. To normalize timestamps to start at 0,
+			// we need to add the offset so that subtracting it gives us 0.
+			track.editListOffset += Math.round(minFirstTimestamp * track.timescale);
+		}
+	}
+
+	/**
+	 * Populates the fragment lookup table from HLS segment information.
+	 * This enables efficient random access seeking without scanning all moof boxes.
+	 *
+	 * @param segments Array of segment info containing duration (in seconds) and virtual byte offset
+	 * @internal
+	 */
+	populateFragmentLookupTableFromSegments(
+		segments: Array<{ durationSeconds: number; moofOffset: number }>,
+	): void {
+		let cumulativeTimeSeconds = 0;
+
+		for (const segment of segments) {
+			// Add lookup entry for each track
+			for (const track of this.tracks) {
+				// Convert cumulative time from seconds to track timescale
+				const timestampInTimescale = Math.round(cumulativeTimeSeconds * track.timescale);
+
+				track.fragmentLookupTable.push({
+					timestamp: timestampInTimescale,
+					moofOffset: segment.moofOffset,
+				});
+			}
+
+			cumulativeTimeSeconds += segment.durationSeconds;
+		}
+
+		// Sort lookup tables by timestamp (they should already be sorted, but ensure consistency)
+		for (const track of this.tracks) {
+			track.fragmentLookupTable.sort((a, b) => a.timestamp - b.timestamp);
+		}
+	}
+
+	/**
+	 * Adjusts the fragment lookup table timestamps by adding each track's editListOffset.
+	 * This must be called AFTER normalizeStartTimestamp() to ensure lookup timestamps
+	 * match the internal timestamp representation used during seeking.
+	 *
+	 * @internal
+	 */
+	adjustFragmentLookupTableForEditListOffset(): void {
+		for (const track of this.tracks) {
+			for (const entry of track.fragmentLookupTable) {
+				entry.timestamp += track.editListOffset;
+			}
+		}
+	}
+
 	readMetadata() {
 		return this.metadataPromise ??= (async () => {
 			let currentPos = 0;

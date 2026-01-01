@@ -1,19 +1,17 @@
 /**
- * HLS Media Player Example using mediabunny's decode pipeline.
- * This version uses Input, CanvasSink, and AudioBufferSink for playback.
+ * HLS Media Player Example using mediabunny's HlsInput (SuperInput pattern).
+ * This version uses the new simplified HLS API.
  */
 import {
-	Input,
-	HlsSource,
-	HlsVirtualSource,
-	HLS_INPUT,
+	HlsInput,
+	HlsVariant,
 	CanvasSink,
 	AudioBufferSink,
 	WrappedAudioBuffer,
 	WrappedCanvas,
 } from 'mediabunny';
 
-// Sample HLS stream (Apple's Big Buck Bunny fMP4 HLS test stream)
+// Sample HLS stream (Apple's fMP4 HLS test stream with muxed audio)
 const SAMPLE_HLS_URL
 	= 'https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8';
 
@@ -48,15 +46,14 @@ let audioContext: AudioContext | null = null;
 let gainNode: GainNode | null = null;
 
 let fileLoaded = false;
+let hlsInput: HlsInput | null = null;
+let currentHlsUrl: string | null = null;
 let videoSink: CanvasSink | null = null;
 let audioSink: AudioBufferSink | null = null;
-let isLiveStream = false;
 
 let totalDuration = 0;
-/** The value of the audio context's currentTime the moment the playback was started. */
 let audioContextStartTime: number | null = null;
 let playing = false;
-/** The timestamp within the media file when the playback was started. */
 let playbackTimeAtStart = 0;
 
 let videoFrameIterator: AsyncGenerator<WrappedCanvas, void, unknown> | null = null;
@@ -64,10 +61,6 @@ let audioBufferIterator: AsyncGenerator<WrappedAudioBuffer, void, unknown> | nul
 let nextFrame: WrappedCanvas | null = null;
 const queuedAudioNodes: Set<AudioBufferSourceNode> = new Set();
 
-/**
- * Used to prevent async race conditions. When asyncId is incremented, already-running async functions will be prevented
- * from having an effect.
- */
 let asyncId = 0;
 
 let draggingProgressBar = false;
@@ -77,9 +70,8 @@ let volumeMuted = false;
 
 /** === INIT LOGIC === */
 
-const initMediaPlayer = async (hlsUrl: string, qualitySelection: 'highest' | 'lowest' | 'auto' = 'auto') => {
+const initMediaPlayer = async (hlsUrl: string, selectedVariant?: HlsVariant) => {
 	try {
-		// First, dispose any ongoing playback
 		if (playing) {
 			pause();
 		}
@@ -93,68 +85,64 @@ const initMediaPlayer = async (hlsUrl: string, qualitySelection: 'highest' | 'lo
 		horizontalRule.style.display = '';
 		loadingElement.style.display = '';
 		playerContainer.style.display = 'none';
-		qualitySelector.style.display = 'none';
 		liveBadge.style.display = 'none';
 		errorElement.textContent = '';
 		warningElement.textContent = '';
 
-		// Create HLS source
-		const hlsSource = new HlsSource(hlsUrl, { qualitySelection });
-
-		// Resolve the HLS stream
-		const resolvedStream = await hlsSource.resolve();
-		isLiveStream = resolvedStream.isLive;
-
-		// Show quality selector if master playlist has variants
-		if (resolvedStream.masterPlaylist && resolvedStream.masterPlaylist.variants.length > 1) {
-			showQualitySelector(hlsUrl, resolvedStream.masterPlaylist.variants);
+		// Reuse existing HlsInput if just changing variant on same URL, otherwise create new
+		const needNewInput = !hlsInput || hlsInput.disposed || currentHlsUrl !== hlsUrl;
+		if (needNewInput) {
+			hlsInput?.dispose();
+			hlsInput = new HlsInput(hlsUrl);
+			currentHlsUrl = hlsUrl;
+			qualitySelector.style.display = 'none';
 		}
 
-		// Show live badge for live streams
-		if (isLiveStream) {
-			liveBadge.style.display = '';
+		// Get available variants
+		const variants = await hlsInput.getVariants();
+
+		// Show quality selector if multiple variants available (only on first load)
+		if (needNewInput && variants.length > 1) {
+			showQualitySelector(hlsUrl, variants);
 		}
 
-		// Create HlsVirtualSource and Input
-		const virtualSource = new HlsVirtualSource(hlsSource);
-		const input = new Input({
-			source: virtualSource,
-			formats: [HLS_INPUT],
-		});
+		// Select variant if specified, otherwise use auto-selected (highest)
+		if (selectedVariant) {
+			await hlsInput.selectVariant(selectedVariant);
+		}
 
-		playbackTimeAtStart = 0;
-		totalDuration = await input.computeDuration();
-		durationElement.textContent = isLiveStream ? 'LIVE' : formatSeconds(totalDuration);
+		// Get tracks directly from HlsInput
+		const videoTrack = await hlsInput.getPrimaryVideoTrack();
+		const audioTrack = await hlsInput.getPrimaryAudioTrack();
 
-		const videoTrack = await input.getPrimaryVideoTrack();
-		const audioTrack = await input.getPrimaryAudioTrack();
+		console.log('Has video track:', !!videoTrack);
+		console.log('Has audio track:', !!audioTrack);
 
 		if (!videoTrack) {
 			throw new Error('No video track found');
 		}
 
+		playbackTimeAtStart = 0;
+		totalDuration = await hlsInput.computeDuration();
+		durationElement.textContent = formatSeconds(totalDuration);
+
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access
 		const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
 
-		// We must create the audio context with the matching sample rate for correct acoustic results
 		audioContext = new AudioContextClass({ sampleRate: audioTrack?.sampleRate });
 		gainNode = audioContext.createGain();
 		gainNode.connect(audioContext.destination);
 		updateVolume();
 
-		// For video, let's use a CanvasSink as it handles rotation and closing video samples for us.
 		videoSink = new CanvasSink(videoTrack, {
 			poolSize: 2,
 			fit: 'contain',
 		});
-		// For audio, we'll use an AudioBufferSink to directly retrieve AudioBuffers compatible with the Web Audio API
 		audioSink = audioTrack ? new AudioBufferSink(audioTrack) : null;
 
-		// Setup canvas size
 		canvas.width = videoTrack.displayWidth;
 		canvas.height = videoTrack.displayHeight;
 
-		// Show volume controls if there's an audio track
 		if (audioTrack) {
 			volumeButton.style.display = '';
 			volumeBarContainer.style.display = '';
@@ -168,14 +156,12 @@ const initMediaPlayer = async (hlsUrl: string, qualitySelection: 'highest' | 'lo
 		await startVideoIterator();
 
 		if (audioContext.state === 'running') {
-			// Start playback automatically if the audio context permits
 			await play();
 		}
 
 		loadingElement.style.display = 'none';
 		playerContainer.style.display = '';
 
-		// Always show controls for video
 		controlsElement.style.opacity = '1';
 		controlsElement.style.pointerEvents = '';
 		playerContainer.style.cursor = '';
@@ -189,7 +175,6 @@ const initMediaPlayer = async (hlsUrl: string, qualitySelection: 'highest' | 'lo
 
 /** === VIDEO RENDERING LOGIC === */
 
-/** Creates a new video frame iterator and renders the first video frame. */
 const startVideoIterator = async () => {
 	if (!videoSink) {
 		return;
@@ -197,42 +182,35 @@ const startVideoIterator = async () => {
 
 	asyncId++;
 
-	await videoFrameIterator?.return(); // Dispose of the current iterator
+	await videoFrameIterator?.return();
 
-	// Create a new iterator
 	videoFrameIterator = videoSink.canvases(getPlaybackTime());
 
-	// Get the first two frames
 	const firstFrame = (await videoFrameIterator.next()).value ?? null;
 	const secondFrame = (await videoFrameIterator.next()).value ?? null;
 
 	nextFrame = secondFrame;
 
 	if (firstFrame) {
-		// Draw the first frame
 		context.clearRect(0, 0, canvas.width, canvas.height);
 		context.drawImage(firstFrame.canvas, 0, 0, canvas.width, canvas.height);
 	}
 };
 
-/** Runs every frame; updates the canvas if necessary. */
 const render = (requestFrame = true) => {
 	if (fileLoaded) {
 		const playbackTime = getPlaybackTime();
 
-		if (playbackTime >= totalDuration && !isLiveStream) {
-			// Pause playback once the end is reached
+		if (playbackTime >= totalDuration) {
 			pause();
 			playbackTimeAtStart = totalDuration;
 		}
 
-		// Check if the current playback time has caught up to the next frame
 		if (nextFrame && nextFrame.timestamp <= playbackTime) {
 			context.clearRect(0, 0, canvas.width, canvas.height);
 			context.drawImage(nextFrame.canvas, 0, 0, canvas.width, canvas.height);
 			nextFrame = null;
 
-			// Request the next frame
 			void updateNextFrame();
 		}
 
@@ -247,14 +225,11 @@ const render = (requestFrame = true) => {
 };
 render();
 
-// Also call the render function on an interval to make sure the video keeps updating even if the tab isn't visible
 setInterval(() => render(false), 500);
 
-/** Iterates over the video frame iterator until it finds a video frame in the future. */
 const updateNextFrame = async () => {
 	const currentAsyncId = asyncId;
 
-	// We have a loop here because we may need to iterate over multiple frames until we reach a frame in the future
 	while (true) {
 		const newNextFrame = (await videoFrameIterator!.next()).value ?? null;
 		if (!newNextFrame) {
@@ -267,11 +242,9 @@ const updateNextFrame = async () => {
 
 		const playbackTime = getPlaybackTime();
 		if (newNextFrame.timestamp <= playbackTime) {
-			// Draw it immediately
 			context.clearRect(0, 0, canvas.width, canvas.height);
 			context.drawImage(newNextFrame.canvas, 0, 0, canvas.width, canvas.height);
 		} else {
-			// Save it for later
 			nextFrame = newNextFrame;
 			break;
 		}
@@ -280,19 +253,24 @@ const updateNextFrame = async () => {
 
 /** === AUDIO PLAYBACK LOGIC === */
 
-/** Loops over the audio buffer iterator, scheduling the audio to be played in the audio context. */
 const runAudioIterator = async () => {
 	if (!audioSink) {
+		console.log('No audio sink available');
 		return;
 	}
 
+	console.log('Starting audio iterator');
 	const currentAsyncId = asyncId;
+	let bufferCount = 0;
 
-	// To play back audio, we loop over all audio chunks (typically very short) of the file and play them at the correct
-	// timestamp. The result is a continuous, uninterrupted audio signal.
 	for await (const { buffer, timestamp } of audioBufferIterator!) {
 		if (currentAsyncId !== asyncId) break;
 		if (!playing) break;
+
+		bufferCount++;
+		if (bufferCount <= 3) {
+			console.log(`Audio buffer ${bufferCount}: timestamp=${timestamp.toFixed(3)}s, duration=${buffer.duration.toFixed(3)}s, channels=${buffer.numberOfChannels}`);
+		}
 
 		const node = audioContext!.createBufferSource();
 		node.buffer = buffer;
@@ -300,17 +278,13 @@ const runAudioIterator = async () => {
 
 		const startTimestamp = audioContextStartTime! + timestamp - playbackTimeAtStart;
 
-		// Two cases: Either, the audio starts in the future or in the past
 		if (startTimestamp >= audioContext!.currentTime) {
-			// If the audio starts in the future, easy, we just schedule it
 			node.start(startTimestamp);
 		} else {
-			// If it starts in the past, then let's only play the audible section that remains from here on out
 			const offset = audioContext!.currentTime - startTimestamp;
 			if (offset < buffer.duration) {
 				node.start(audioContext!.currentTime, offset);
 			} else {
-				// Completely in the past, skip
 				continue;
 			}
 		}
@@ -320,8 +294,6 @@ const runAudioIterator = async () => {
 			queuedAudioNodes.delete(node);
 		};
 
-		// If we're more than 2 seconds ahead of the current playback time, let's slow down the loop
-		// until time has passed. Using 2 seconds for HLS to account for network latency.
 		if (timestamp - getPlaybackTime() >= 2) {
 			await new Promise<void>((resolve) => {
 				const checkInterval = () => {
@@ -343,10 +315,8 @@ const runAudioIterator = async () => {
 
 /** === PLAYBACK CONTROL LOGIC === */
 
-/** Returns the current playback time in the media file. */
 const getPlaybackTime = () => {
 	if (playing) {
-		// To ensure perfect audio-video sync, we always use the audio context's clock to determine playback time
 		return audioContext!.currentTime - audioContextStartTime! + playbackTimeAtStart;
 	} else {
 		return playbackTimeAtStart;
@@ -358,8 +328,7 @@ const play = async () => {
 		await audioContext!.resume();
 	}
 
-	if (getPlaybackTime() >= totalDuration && !isLiveStream) {
-		// If we're at the end, let's snap back to the start
+	if (getPlaybackTime() >= totalDuration) {
 		playbackTimeAtStart = 0;
 		await startVideoIterator();
 	}
@@ -368,10 +337,11 @@ const play = async () => {
 	playing = true;
 
 	if (audioSink) {
-		// Start the audio iterator
 		void audioBufferIterator?.return();
 		audioBufferIterator = audioSink.buffers(getPlaybackTime());
-		void runAudioIterator();
+		runAudioIterator().catch((err) => {
+			console.error('Audio iterator error:', err);
+		});
 	}
 
 	playIcon.style.display = 'none';
@@ -381,10 +351,9 @@ const play = async () => {
 const pause = () => {
 	playbackTimeAtStart = getPlaybackTime();
 	playing = false;
-	void audioBufferIterator?.return(); // This stops any for-loops that are iterating the iterator
+	void audioBufferIterator?.return();
 	audioBufferIterator = null;
 
-	// Stop all audio nodes that were already queued to play
 	for (const node of queuedAudioNodes) {
 		node.stop();
 	}
@@ -422,15 +391,11 @@ const seekToTime = async (seconds: number) => {
 
 /** === QUALITY SELECTOR === */
 
-type Variant = { bandwidth: number; resolution?: { width: number; height: number } };
-
-const showQualitySelector = (hlsUrl: string, variants: Variant[]) => {
-	// Clear existing buttons (except the label)
+const showQualitySelector = (hlsUrl: string, variants: HlsVariant[]) => {
 	while (qualitySelector.children.length > 1) {
 		qualitySelector.removeChild(qualitySelector.lastChild!);
 	}
 
-	// Sort variants by bandwidth
 	const sortedVariants = [...variants].sort((a, b) => b.bandwidth - a.bandwidth);
 
 	for (const variant of sortedVariants) {
@@ -444,7 +409,7 @@ const showQualitySelector = (hlsUrl: string, variants: Variant[]) => {
 
 		button.textContent = label;
 		button.addEventListener('click', () => {
-			void initMediaPlayer(hlsUrl, { bandwidth: variant.bandwidth } as never);
+			void initMediaPlayer(hlsUrl, variant);
 		});
 
 		qualitySelector.appendChild(button);
@@ -462,8 +427,6 @@ const updateProgressBarTime = (seconds: number) => {
 };
 
 progressBarContainer.addEventListener('pointerdown', (event) => {
-	if (isLiveStream) return;
-
 	draggingProgressBar = true;
 	progressBarContainer.setPointerCapture(event.pointerId);
 
@@ -502,7 +465,7 @@ const updateVolume = () => {
 	volumeBar.style.width = `${actualVolume * 100}%`;
 
 	if (gainNode) {
-		gainNode.gain.value = actualVolume ** 2; // Quadratic for more fine-grained control
+		gainNode.gain.value = actualVolume ** 2;
 	}
 
 	const iconNumber = volumeMuted ? 0 : Math.ceil(1 + 3 * volume);
@@ -600,10 +563,10 @@ window.addEventListener('keydown', (e) => {
 		togglePlay();
 	} else if (e.code === 'KeyF') {
 		fullscreenButton.click();
-	} else if (e.code === 'ArrowLeft' && !isLiveStream) {
+	} else if (e.code === 'ArrowLeft') {
 		const newTime = Math.max(getPlaybackTime() - 5, 0);
 		void seekToTime(newTime);
-	} else if (e.code === 'ArrowRight' && !isLiveStream) {
+	} else if (e.code === 'ArrowRight') {
 		const newTime = Math.min(getPlaybackTime() + 5, totalDuration);
 		void seekToTime(newTime);
 	} else if (e.code === 'KeyM') {
@@ -674,7 +637,7 @@ const formatSeconds = (seconds: number) => {
 window.addEventListener('resize', () => {
 	if (totalDuration && isFinite(totalDuration)) {
 		updateProgressBarTime(getPlaybackTime());
-		durationElement.textContent = isLiveStream ? 'LIVE' : formatSeconds(totalDuration);
+		durationElement.textContent = formatSeconds(totalDuration);
 	}
 });
 

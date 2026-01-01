@@ -14,7 +14,7 @@ import {
 	HlsSource,
 	parseMediaPlaylist,
 	type HlsSegmentInfo,
-} from '../../src/hls/index.js';
+} from '../../src/hls_old/index.js';
 
 describe('HlsOutputFormat', () => {
 	describe('constructor', () => {
@@ -361,7 +361,7 @@ describe('HlsSource', () => {
 
 describe('HlsInputFormat', () => {
 	it('should have correct name and mimeType', async () => {
-		const { HLS_INPUT } = await import('../../src/hls/index.js');
+		const { HLS_INPUT } = await import('../../src/hls_old/index.js');
 		expect(HLS_INPUT.name).toBe('HLS');
 		expect(HLS_INPUT.mimeType).toBe('application/vnd.apple.mpegurl');
 	});
@@ -369,25 +369,25 @@ describe('HlsInputFormat', () => {
 
 describe('HlsVirtualSource', () => {
 	it('should create successfully', async () => {
-		const { HlsSource, HlsVirtualSource } = await import('../../src/hls/index.js');
+		const { HlsSource, HlsVirtualSource } = await import('../../src/hls_old/index.js');
 		const hlsSource = new HlsSource('https://example.com/stream.m3u8');
 		expect(() => new HlsVirtualSource(hlsSource)).not.toThrow();
 	});
 
 	it('should throw on invalid hlsSource', async () => {
-		const { HlsVirtualSource } = await import('../../src/hls/index.js');
+		const { HlsVirtualSource } = await import('../../src/hls_old/index.js');
 		expect(() => new HlsVirtualSource(null as never)).toThrow(TypeError);
 	});
 
 	it('should expose getHlsSource method', async () => {
-		const { HlsSource, HlsVirtualSource } = await import('../../src/hls/index.js');
+		const { HlsSource, HlsVirtualSource } = await import('../../src/hls_old/index.js');
 		const hlsSource = new HlsSource('https://example.com/stream.m3u8');
 		const virtualSource = new HlsVirtualSource(hlsSource);
 		expect(virtualSource.getHlsSource()).toBe(hlsSource);
 	});
 
 	it('should have _isHlsVirtualSource marker', async () => {
-		const { HlsSource, HlsVirtualSource } = await import('../../src/hls/index.js');
+		const { HlsSource, HlsVirtualSource } = await import('../../src/hls_old/index.js');
 		const hlsSource = new HlsSource('https://example.com/stream.m3u8');
 		const virtualSource = new HlsVirtualSource(hlsSource);
 		expect(virtualSource._isHlsVirtualSource).toBe(true);
@@ -396,14 +396,14 @@ describe('HlsVirtualSource', () => {
 
 describe('createHlsVirtualSource', () => {
 	it('should create HlsVirtualSource from URL', async () => {
-		const { createHlsVirtualSource, HlsVirtualSource } = await import('../../src/hls/index.js');
+		const { createHlsVirtualSource, HlsVirtualSource } = await import('../../src/hls_old/index.js');
 		const source = createHlsVirtualSource('https://example.com/stream.m3u8');
 		expect(source).toBeInstanceOf(HlsVirtualSource);
 		expect(source._isHlsVirtualSource).toBe(true);
 	});
 
 	it('should pass options to HlsSource', async () => {
-		const { createHlsVirtualSource } = await import('../../src/hls/index.js');
+		const { createHlsVirtualSource } = await import('../../src/hls_old/index.js');
 		// Just verify it doesn't throw with options
 		expect(() => createHlsVirtualSource('https://example.com/stream.m3u8', {
 			qualitySelection: 'highest',
@@ -415,7 +415,7 @@ describe('createHlsVirtualSource', () => {
 describe('Live Streaming', () => {
 	describe('HlsSource live detection', () => {
 		it('should detect VOD stream (has #EXT-X-ENDLIST)', async () => {
-			const { HlsSource } = await import('../../src/hls/index.js');
+			const { HlsSource } = await import('../../src/hls_old/index.js');
 
 			const vodPlaylist = [
 				'#EXTM3U',
@@ -440,7 +440,7 @@ describe('Live Streaming', () => {
 		});
 
 		it('should detect live stream (no #EXT-X-ENDLIST)', async () => {
-			const { HlsSource } = await import('../../src/hls/index.js');
+			const { HlsSource } = await import('../../src/hls_old/index.js');
 
 			const livePlaylist = [
 				'#EXTM3U',
@@ -466,7 +466,7 @@ describe('Live Streaming', () => {
 		});
 
 		it('should return null for isLive() before resolve', async () => {
-			const { HlsSource } = await import('../../src/hls/index.js');
+			const { HlsSource } = await import('../../src/hls_old/index.js');
 			const source = new HlsSource('https://example.com/stream.m3u8');
 			expect(source.isLive()).toBeNull();
 		});
@@ -474,7 +474,7 @@ describe('Live Streaming', () => {
 
 	describe('HlsSource refreshPlaylist', () => {
 		it('should refresh live playlist', async () => {
-			const { HlsSource } = await import('../../src/hls/index.js');
+			const { HlsSource } = await import('../../src/hls_old/index.js');
 
 			let fetchCount = 0;
 			const mockFetch: typeof fetch = async () => {
@@ -504,7 +504,7 @@ describe('Live Streaming', () => {
 		});
 
 		it('should not refetch VOD playlists', async () => {
-			const { HlsSource } = await import('../../src/hls/index.js');
+			const { HlsSource } = await import('../../src/hls_old/index.js');
 
 			let fetchCount = 0;
 			const mockFetch: typeof fetch = async () => {
@@ -533,7 +533,7 @@ describe('Live Streaming', () => {
 		});
 
 		it('should throw if called before resolve', async () => {
-			const { HlsSource } = await import('../../src/hls/index.js');
+			const { HlsSource } = await import('../../src/hls_old/index.js');
 			const source = new HlsSource('https://example.com/stream.m3u8');
 			await expect(source.refreshPlaylist()).rejects.toThrow('not been resolved');
 		});
@@ -541,18 +541,18 @@ describe('Live Streaming', () => {
 
 	describe('HlsOutputFormat live options', () => {
 		it('should support EVENT playlist type', async () => {
-			const { HlsOutputFormat } = await import('../../src/hls/index.js');
+			const { HlsOutputFormat } = await import('../../src/hls_old/index.js');
 			expect(() => new HlsOutputFormat({ playlistType: 'EVENT' })).not.toThrow();
 		});
 
 		it('should support undefined playlist type for live', async () => {
-			const { HlsOutputFormat } = await import('../../src/hls/index.js');
+			const { HlsOutputFormat } = await import('../../src/hls_old/index.js');
 			const format = new HlsOutputFormat({ playlistType: undefined });
 			expect(format._options.playlistType).toBeUndefined();
 		});
 
 		it('should support maxSegmentCount for sliding window', async () => {
-			const { HlsOutputFormat } = await import('../../src/hls/index.js');
+			const { HlsOutputFormat } = await import('../../src/hls_old/index.js');
 			const format = new HlsOutputFormat({ maxSegmentCount: 10 });
 			expect(format._options.maxSegmentCount).toBe(10);
 		});

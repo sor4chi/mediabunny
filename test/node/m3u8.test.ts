@@ -7,12 +7,12 @@ import {
 	writeMasterPlaylist,
 	writeMediaPlaylist,
 	M3U8ParseError,
-} from '../../src/hls/index.js';
+} from '../../src/hls_old/index.js';
 import type {
 	MasterPlaylist,
 	MediaPlaylist,
 	EncryptionKey,
-} from '../../src/hls/index.js';
+} from '../../src/hls_old/index.js';
 
 // ============================================================================
 // Basic Parsing Tests

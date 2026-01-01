@@ -17,6 +17,7 @@
     "Codecs": "Codecs understood by Mediabunny.",
     "Encoding": "Encoder configuration and encodability checks.",
     "Custom coders": "API for adding custom encoders and decoders.",
+    "HLS": "HTTP Live Streaming (HLS) input support.",
     "Miscellaneous": "Whatever's left.",
 
     "@mediabunny/mp3-encoder": "Adds MP3 encoder support to Mediabunny."
