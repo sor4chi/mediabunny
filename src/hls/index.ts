@@ -10,6 +10,9 @@
 export { HlsInput } from './hls-input';
 export type { HlsInputOptions, HlsVariant } from './hls-input';
 
+// HLS Errors
+export { HlsLiveEdgeError } from './hls-variant-input';
+
 // M3U8 Parser
 export {
 	parsePlaylist,

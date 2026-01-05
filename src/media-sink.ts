@@ -438,7 +438,8 @@ export abstract class BaseMediaSampleSink<
 					ended = true;
 				}
 
-				if (ended) {
+				// Close sample immediately if we're in any termination state to prevent GC warnings
+				if (ended || terminated || outOfBandError) {
 					sample.close();
 					return;
 				}
@@ -459,6 +460,10 @@ export abstract class BaseMediaSampleSink<
 				if (sample.timestamp >= startTimestamp) {
 					sampleQueue.push(sample);
 					firstSampleQueued = true;
+				} else if (firstSampleQueued) {
+					// Sample is before startTimestamp and we've already queued samples, so this is an
+					// out-of-order sample that we don't need. Close it to prevent GC warnings.
+					sample.close();
 				}
 
 				lastSample = firstSampleQueued ? null : sample;
@@ -474,64 +479,68 @@ export abstract class BaseMediaSampleSink<
 				}
 			});
 
-			const packetSink = this._createPacketSink();
-			const keyPacket = await packetSink.getKeyPacket(startTimestamp, { verifyKeyPackets: true })
-				?? await packetSink.getFirstPacket();
+			try {
+				const packetSink = this._createPacketSink();
+				const keyPacket = await packetSink.getKeyPacket(startTimestamp, { verifyKeyPackets: true })
+					?? await packetSink.getFirstPacket();
 
-			let currentPacket: EncodedPacket | null = keyPacket;
+				let currentPacket: EncodedPacket | null = keyPacket;
 
-			let endPacket: EncodedPacket | undefined = undefined;
-			if (endTimestamp < Infinity) {
-				// When an end timestamp is set, we cannot simply use that for the packet iterator due to out-of-order
-				// frames (B-frames). Instead, we'll need to keep decoding packets until we get a frame that exceeds
-				// this end time. However, we can still put a bound on it: Since key frames are by definition never
-				// out of order, we can stop at the first key frame after the end timestamp.
-				const packet = await packetSink.getPacket(endTimestamp);
-				const keyPacket = !packet
-					? null
-					: packet.type === 'key' && packet.timestamp === endTimestamp
-						? packet
-						: await packetSink.getNextKeyPacket(packet, { verifyKeyPackets: true });
+				let endPacket: EncodedPacket | undefined = undefined;
+				if (endTimestamp < Infinity) {
+					// When an end timestamp is set, we cannot simply use that for the packet iterator due to
+					// out-of-order frames (B-frames). Instead, we'll need to keep decoding packets until we get a
+					// frame that exceeds this end time. However, we can still put a bound on it: Since key frames
+					// are by definition never out of order, we can stop at the first key frame after the end
+					// timestamp.
+					const packet = await packetSink.getPacket(endTimestamp);
+					const keyPacket = !packet
+						? null
+						: packet.type === 'key' && packet.timestamp === endTimestamp
+							? packet
+							: await packetSink.getNextKeyPacket(packet, { verifyKeyPackets: true });
 
-				if (keyPacket) {
-					endPacket = keyPacket;
-				}
-			}
-
-			const packets = packetSink.packets(keyPacket ?? undefined, endPacket);
-			await packets.next(); // Skip the start packet as we already have it
-
-			while (currentPacket && !ended && !this._track.input._disposed) {
-				const maxQueueSize = computeMaxQueueSize(sampleQueue.length);
-				if (sampleQueue.length + decoder.getDecodeQueueSize() > maxQueueSize) {
-					({ promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers());
-					await queueDequeue;
-					continue;
+					if (keyPacket) {
+						endPacket = keyPacket;
+					}
 				}
 
-				decoder.decode(currentPacket);
+				const packets = packetSink.packets(keyPacket ?? undefined, endPacket);
+				await packets.next(); // Skip the start packet as we already have it
 
-				const packetResult = await packets.next();
-				if (packetResult.done) {
-					break;
+				while (currentPacket && !ended && !this._track.input._disposed) {
+					const maxQueueSize = computeMaxQueueSize(sampleQueue.length);
+					if (sampleQueue.length + decoder.getDecodeQueueSize() > maxQueueSize) {
+						({ promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers());
+						await queueDequeue;
+						continue;
+					}
+
+					decoder.decode(currentPacket);
+
+					const packetResult = await packets.next();
+					if (packetResult.done) {
+						break;
+					}
+
+					currentPacket = packetResult.value;
 				}
 
-				currentPacket = packetResult.value;
+				await packets.return();
+
+				if (!terminated && !this._track.input._disposed) {
+					await decoder.flush();
+				}
+
+				if (!firstSampleQueued && lastSample) {
+					sampleQueue.push(lastSample);
+				}
+			} finally {
+				// Always close the decoder to prevent sample leaks
+				decoder.close();
+				decoderIsFlushed = true;
+				onQueueNotEmpty(); // To unstuck the generator
 			}
-
-			await packets.return();
-
-			if (!terminated && !this._track.input._disposed) {
-				await decoder.flush();
-			}
-			decoder.close();
-
-			if (!firstSampleQueued && lastSample) {
-				sampleQueue.push(lastSample);
-			}
-
-			decoderIsFlushed = true;
-			onQueueNotEmpty(); // To unstuck the generator
 		})().catch((error: Error) => {
 			if (!outOfBandError) {
 				outOfBandError = error;
@@ -617,7 +626,8 @@ export abstract class BaseMediaSampleSink<
 			const decoder = await this._createDecoder((sample) => {
 				onQueueDequeue();
 
-				if (terminated) {
+				// Close sample immediately if we're in any termination state to prevent GC warnings
+				if (terminated || outOfBandError) {
 					sample.close();
 					return;
 				}
@@ -646,105 +656,109 @@ export abstract class BaseMediaSampleSink<
 				}
 			});
 
-			const packetSink = this._createPacketSink();
-			let lastPacket: EncodedPacket | null = null;
-			let lastKeyPacket: EncodedPacket | null = null;
+			try {
+				const packetSink = this._createPacketSink();
+				let lastPacket: EncodedPacket | null = null;
+				let lastKeyPacket: EncodedPacket | null = null;
 
-			// The end sequence number (inclusive) in the next batch of packets that will be decoded. The batch starts
-			// at the last key frame and goes until this sequence number.
-			let maxSequenceNumber = -1;
+				// The end sequence number (inclusive) in the next batch of packets that will be decoded. The batch
+				// starts at the last key frame and goes until this sequence number.
+				let maxSequenceNumber = -1;
 
-			const decodePackets = async () => {
-				assert(lastKeyPacket);
+				const decodePackets = async () => {
+					assert(lastKeyPacket);
 
-				// Start at the current key packet
-				let currentPacket = lastKeyPacket;
-				decoder.decode(currentPacket);
+					// Start at the current key packet
+					let currentPacket = lastKeyPacket;
+					decoder.decode(currentPacket);
 
-				while (currentPacket.sequenceNumber < maxSequenceNumber) {
-					const maxQueueSize = computeMaxQueueSize(sampleQueue.length);
-					while (sampleQueue.length + decoder.getDecodeQueueSize() > maxQueueSize && !terminated) {
-						({ promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers());
-						await queueDequeue;
+					while (currentPacket.sequenceNumber < maxSequenceNumber) {
+						const maxQueueSize = computeMaxQueueSize(sampleQueue.length);
+						while (sampleQueue.length + decoder.getDecodeQueueSize() > maxQueueSize && !terminated) {
+							({ promise: queueDequeue, resolve: onQueueDequeue } = promiseWithResolvers());
+							await queueDequeue;
+						}
+
+						if (terminated) {
+							break;
+						}
+
+						const nextPacket = await packetSink.getNextPacket(currentPacket);
+						assert(nextPacket);
+
+						decoder.decode(nextPacket);
+						currentPacket = nextPacket;
 					}
 
-					if (terminated) {
+					maxSequenceNumber = -1;
+				};
+
+				const flushDecoder = async () => {
+					await decoder.flush();
+
+					// We don't expect this list to have any elements in it anymore, but in case it does, let's emit
+					// nulls for every remaining element, then clear it.
+					for (let i = 0; i < timestampsOfInterest.length; i++) {
+						pushToQueue(null);
+					}
+					timestampsOfInterest.length = 0;
+				};
+
+				for await (const timestamp of timestampIterator) {
+					validateTimestamp(timestamp);
+
+					if (terminated || this._track.input._disposed) {
 						break;
 					}
 
-					const nextPacket = await packetSink.getNextPacket(currentPacket);
-					assert(nextPacket);
+					const targetPacket = await packetSink.getPacket(timestamp);
+					const keyPacket = targetPacket
+						&& await packetSink.getKeyPacket(timestamp, { verifyKeyPackets: true });
 
-					decoder.decode(nextPacket);
-					currentPacket = nextPacket;
-				}
+					if (!keyPacket) {
+						if (maxSequenceNumber !== -1) {
+							await decodePackets();
+							await flushDecoder();
+						}
 
-				maxSequenceNumber = -1;
-			};
-
-			const flushDecoder = async () => {
-				await decoder.flush();
-
-				// We don't expect this list to have any elements in it anymore, but in case it does, let's emit
-				// nulls for every remaining element, then clear it.
-				for (let i = 0; i < timestampsOfInterest.length; i++) {
-					pushToQueue(null);
-				}
-				timestampsOfInterest.length = 0;
-			};
-
-			for await (const timestamp of timestampIterator) {
-				validateTimestamp(timestamp);
-
-				if (terminated || this._track.input._disposed) {
-					break;
-				}
-
-				const targetPacket = await packetSink.getPacket(timestamp);
-				const keyPacket = targetPacket && await packetSink.getKeyPacket(timestamp, { verifyKeyPackets: true });
-
-				if (!keyPacket) {
-					if (maxSequenceNumber !== -1) {
-						await decodePackets();
-						await flushDecoder();
+						pushToQueue(null);
+						lastPacket = null;
+						continue;
 					}
 
-					pushToQueue(null);
-					lastPacket = null;
-					continue;
+					// Check if the key packet has changed or if we're going back in time
+					if (
+						lastPacket
+						&& (
+							keyPacket.sequenceNumber !== lastKeyPacket!.sequenceNumber
+							|| targetPacket.timestamp < lastPacket.timestamp
+						)
+					) {
+						await decodePackets();
+						await flushDecoder(); // Always flush here, improves decoder compatibility
+					}
+
+					timestampsOfInterest.push(targetPacket.timestamp);
+					maxSequenceNumber = Math.max(targetPacket.sequenceNumber, maxSequenceNumber);
+
+					lastPacket = targetPacket;
+					lastKeyPacket = keyPacket;
 				}
 
-				// Check if the key packet has changed or if we're going back in time
-				if (
-					lastPacket
-					&& (
-						keyPacket.sequenceNumber !== lastKeyPacket!.sequenceNumber
-						|| targetPacket.timestamp < lastPacket.timestamp
-					)
-				) {
-					await decodePackets();
-					await flushDecoder(); // Always flush here, improves decoder compatibility
+				if (!terminated && !this._track.input._disposed) {
+					if (maxSequenceNumber !== -1) {
+						// We still need to decode packets
+						await decodePackets();
+					}
+
+					await flushDecoder();
 				}
-
-				timestampsOfInterest.push(targetPacket.timestamp);
-				maxSequenceNumber = Math.max(targetPacket.sequenceNumber, maxSequenceNumber);
-
-				lastPacket = targetPacket;
-				lastKeyPacket = keyPacket;
+			} finally {
+				// Always close the decoder to prevent sample leaks
+				decoder.close();
+				decoderIsFlushed = true;
+				onQueueNotEmpty(); // To unstuck the generator
 			}
-
-			if (!terminated && !this._track.input._disposed) {
-				if (maxSequenceNumber !== -1) {
-					// We still need to decode packets
-					await decodePackets();
-				}
-
-				await flushDecoder();
-			}
-			decoder.close();
-
-			decoderIsFlushed = true;
-			onQueueNotEmpty(); // To unstuck the generator
 		})().catch((error: Error) => {
 			if (!outOfBandError) {
 				outOfBandError = error;

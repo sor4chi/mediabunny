@@ -29,6 +29,7 @@ import {
 	Vp9CodecInfo,
 } from '../codec-data';
 import { Demuxer } from '../demuxer';
+import type { FragmentedMediaSource } from '../fragmented-media-source';
 import { Input } from '../input';
 import {
 	InputAudioTrack,
@@ -256,6 +257,21 @@ export class IsobmffDemuxer extends Demuxer {
 	 */
 	lastReadFragment: Fragment | null = null;
 
+	/**
+	 * Reference to a FragmentedMediaSource for segment-based lookup in live streams.
+	 * When set and isLive is true, fragment lookups use segment-based addressing
+	 * instead of byte offsets.
+	 * @internal
+	 */
+	private fragmentedSource: FragmentedMediaSource | null = null;
+
+	/**
+	 * Whether to use segment-based lookup for fragment access.
+	 * This is automatically set to true when setFragmentedSource is called with a live source.
+	 * @internal
+	 */
+	private useSegmentBasedLookup = false;
+
 	constructor(input: Input) {
 		super(input);
 
@@ -289,6 +305,28 @@ export class IsobmffDemuxer extends Demuxer {
 	async getMetadataTags() {
 		await this.readMetadata();
 		return this.metadataTags;
+	}
+
+	/**
+	 * Sets a FragmentedMediaSource for segment-based fragment lookup.
+	 * When the source is a live stream, this enables segment-based addressing
+	 * instead of byte offsets, which is necessary because byte offsets become
+	 * invalid when the HLS sliding window removes old segments.
+	 *
+	 * @param source The FragmentedMediaSource to use for segment-based lookups.
+	 * @internal
+	 */
+	setFragmentedSource(source: FragmentedMediaSource): void {
+		this.fragmentedSource = source;
+		this.useSegmentBasedLookup = source.isLive;
+	}
+
+	/**
+	 * Returns whether segment-based lookup is enabled.
+	 * @internal
+	 */
+	isUsingSegmentBasedLookup(): boolean {
+		return this.useSegmentBasedLookup;
 	}
 
 	/**
@@ -405,6 +443,39 @@ export class IsobmffDemuxer extends Demuxer {
 		}
 
 		// Lookup tables remain sorted since we're appending new (later) segments
+	}
+
+	/**
+	 * Removes fragment lookup table entries for removed segments.
+	 * Used by HLS live streams when segments are removed from the sliding window.
+	 *
+	 * @param removedSegmentIds Array of removed segment IDs (mediaSequence numbers).
+	 *                          Note: Currently we only use the count since lookup table
+	 *                          entries don't store segment IDs. This works correctly for
+	 *                          prefix removals. For live streams with segment-based lookup,
+	 *                          the lookup table is not used for seeking anyway.
+	 * @internal
+	 */
+	removeOldFragmentsFromLookupTable(removedSegmentIds: number[]): void {
+		// For now, we remove entries from the beginning matching the count
+		// This works for typical sliding window behavior (prefix removal)
+		// For more complex removal patterns, the segment-based lookup path
+		// handles this correctly by checking getAvailableSegments()
+		const count = removedSegmentIds.length;
+
+		for (const track of this.tracks) {
+			// Remove lookup table entries from the beginning
+			track.fragmentLookupTable.splice(0, count);
+
+			// Also clean up position cache - remove entries that point to offsets
+			// before the first remaining lookup entry
+			if (track.fragmentLookupTable.length > 0) {
+				const minValidOffset = track.fragmentLookupTable[0]!.moofOffset;
+				track.fragmentPositionCache = track.fragmentPositionCache.filter(
+					entry => entry.moofOffset >= minValidOffset,
+				);
+			}
+		}
 	}
 
 	readMetadata() {
@@ -2744,7 +2815,12 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		return packet;
 	}
 
-	private async fetchPacketInFragment(fragment: Fragment, sampleIndex: number, options: PacketRetrievalOptions) {
+	private async fetchPacketInFragment(
+		fragment: Fragment,
+		sampleIndex: number,
+		options: PacketRetrievalOptions,
+		timestampAdjustmentSeconds = 0,
+	) {
 		if (sampleIndex === -1) {
 			return null;
 		}
@@ -2768,7 +2844,7 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		}
 
 		const timestamp = (fragmentSample.presentationTimestamp - this.internalTrack.editListOffset)
-			/ this.internalTrack.timescale;
+			/ this.internalTrack.timescale + timestampAdjustmentSeconds;
 		const duration = fragmentSample.duration / this.internalTrack.timescale;
 		const packet = new EncodedPacket(
 			data,
@@ -2784,6 +2860,158 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		return packet;
 	}
 
+	/**
+	 * Performs segment-based lookup for live streams.
+	 * Instead of using byte offsets (which become invalid when segments are removed),
+	 * this method finds the segment containing the timestamp and reads fragment data directly.
+	 * @internal
+	 */
+	private async performSegmentBasedLookup(
+		getMatchInFragment: (fragment: Fragment) => { sampleIndex: number; correctSampleFound: boolean },
+		searchTimestamp: number,
+		options: PacketRetrievalOptions,
+	): Promise<EncodedPacket | null> {
+		const demuxer = this.internalTrack.demuxer;
+		const fragmentedSource = demuxer['fragmentedSource'];
+
+		if (!fragmentedSource) {
+			return null;
+		}
+
+		// Validate track metadata before timestamp conversion
+		const timescale = this.internalTrack.timescale;
+		const editListOffset = this.internalTrack.editListOffset ?? 0;
+
+		if (!timescale || timescale <= 0 || !Number.isFinite(timescale)) {
+			// Invalid timescale, fall back to byte-offset lookup
+			return null;
+		}
+
+		// Convert internal timestamp to seconds
+		const timeInSeconds = (searchTimestamp - editListOffset) / timescale;
+
+		// Validate the conversion result
+		if (!Number.isFinite(timeInSeconds) || timeInSeconds < 0) {
+			// Invalid timestamp conversion, fall back to byte-offset lookup
+			return null;
+		}
+
+		// Check if time is within available range
+		const availableRange = fragmentedSource.getAvailableTimeRange();
+		if (timeInSeconds < availableRange.start || timeInSeconds > availableRange.end) {
+			// Outside available range - this is expected for live streams, fall back silently
+			return null;
+		}
+
+		// Find the segment containing this timestamp
+		const segmentInfo = fragmentedSource.findSegmentAtTime(timeInSeconds);
+		if (!segmentInfo) {
+			return null;
+		}
+
+		try {
+			// Read the segment data
+			const segmentData = await fragmentedSource.readSegmentData(segmentInfo.segmentId);
+
+			// Create a DataView for parsing
+			const view = new DataView(segmentData.buffer, segmentData.byteOffset, segmentData.byteLength);
+
+			// Find and parse the moof box in the segment data
+			let pos = 0;
+			while (pos < segmentData.length) {
+				if (pos + 8 > segmentData.length) break;
+
+				const boxSize = view.getUint32(pos, false);
+				const boxType = String.fromCharCode(
+					segmentData[pos + 4]!,
+					segmentData[pos + 5]!,
+					segmentData[pos + 6]!,
+					segmentData[pos + 7]!,
+				);
+
+				if (boxType === 'moof') {
+					// Found the moof box - use the demuxer to read the fragment
+					// We need to calculate the virtual byte offset for this segment
+					// to read the fragment through the normal path
+					const segmentStartOffset = this.getSegmentByteOffset(segmentInfo.segmentId);
+					if (segmentStartOffset !== null) {
+						const fragment = await demuxer.readFragment(segmentStartOffset + pos);
+						const { sampleIndex, correctSampleFound } = getMatchInFragment(fragment);
+						if (correctSampleFound || sampleIndex !== -1) {
+							// Calculate timestamp adjustment for discontinuity handling.
+							// After a #EXT-X-DISCONTINUITY, the fMP4 baseMediaDecodeTime may reset,
+							// but the HLS timeline continues. We need to adjust the timestamps
+							// to match the expected HLS timeline.
+							let timestampAdjustment = 0;
+							if (fragmentedSource.getSegmentExpectedStartTime) {
+								const expectedStartTime = fragmentedSource.getSegmentExpectedStartTime(
+									segmentInfo.segmentId,
+								);
+								if (expectedStartTime !== undefined) {
+									// Get the fragment's base timestamp (baseMediaDecodeTime from tfdt)
+									const trackData = fragment.trackData.get(this.internalTrack.id);
+									if (trackData) {
+										// Calculate what the normal timestamp would be for fragment start
+										const normalFragmentStartTime =
+											(trackData.startTimestamp - editListOffset) / timescale;
+										// The adjustment is the difference between expected and normal
+										// For non-discontinuity segments, this should be ~0
+										// For segments after discontinuity, this corrects the timeline
+										timestampAdjustment = expectedStartTime - normalFragmentStartTime;
+
+										// Debug logging
+										if (Math.abs(timestampAdjustment) > 0.1) {
+											const trackType = this.internalTrack.info?.type ?? 'unknown';
+											console.log(`[HLS Discontinuity] Segment ${segmentInfo.segmentId} (${trackType}): ` +
+												`expected=${expectedStartTime.toFixed(2)}s, ` +
+												`normal=${normalFragmentStartTime.toFixed(2)}s, ` +
+												`adjustment=${timestampAdjustment.toFixed(2)}s, ` +
+												`baseTime=${trackData.startTimestamp}, editOffset=${editListOffset}`);
+										}
+									}
+								}
+							}
+							return this.fetchPacketInFragment(fragment, sampleIndex, options, timestampAdjustment);
+						}
+					}
+					break;
+				}
+
+				pos += boxSize;
+				if (boxSize === 0) break; // Prevent infinite loop on malformed data
+			}
+		} catch {
+			// Error reading segment, fall back to byte-offset lookup
+		}
+
+		return null;
+	}
+
+	/**
+	 * Gets the virtual byte offset for a segment ID.
+	 * This is used to read fragments through the normal demuxer path.
+	 * @internal
+	 */
+	private getSegmentByteOffset(segmentId: number): number | null {
+		const demuxer = this.internalTrack.demuxer;
+		const fragmentedSource = demuxer['fragmentedSource'];
+
+		if (!fragmentedSource) return null;
+
+		// Use the efficient method if available
+		if (fragmentedSource.getSegmentByteOffset) {
+			const offset = fragmentedSource.getSegmentByteOffset(segmentId);
+			return offset !== undefined ? offset : null;
+		}
+
+		// Fallback: iterate through all segments (less efficient)
+		const segments = fragmentedSource.getAvailableSegments();
+		const segment = segments.find(s => s.segmentId === segmentId);
+		if (!segment || segment.byteOffset === undefined) return null;
+
+		return segment.byteOffset;
+	}
+
 	/** Looks for a packet in the fragments while trying to load as few fragments as possible to retrieve it. */
 	private async performFragmentedLookup(
 		// The fragment where we start looking
@@ -2797,6 +3025,21 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 		options: PacketRetrievalOptions,
 	): Promise<EncodedPacket | null> {
 		const demuxer = this.internalTrack.demuxer;
+
+		// For live streams with segment-based lookup, use the segment-based path
+		if (demuxer['useSegmentBasedLookup'] && demuxer['fragmentedSource']) {
+			const result = await this.performSegmentBasedLookup(
+				getMatchInFragment,
+				searchTimestamp,
+				options,
+			);
+			// If segment-based lookup succeeds, return the result
+			// If it fails (returns null), fall through to the byte-offset path
+			// which may still work if the data is available
+			if (result) {
+				return result;
+			}
+		}
 
 		let currentFragment: Fragment | null = null;
 		let bestFragment: Fragment | null = null;
@@ -2817,11 +3060,18 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 
 		// Search for a lookup entry; this way, we won't need to start searching from the start of the file
 		// but can jump right into the correct fragment (or at least nearby).
-		const lookupEntryIndex = binarySearchLessOrEqual(
+		let lookupEntryIndex = binarySearchLessOrEqual(
 			this.internalTrack.fragmentLookupTable,
 			searchTimestamp,
 			x => x.timestamp,
 		);
+
+		// If searchTimestamp is before all lookup entries (e.g., old data was removed from a live stream),
+		// fall back to the first available entry instead of returning null
+		if (lookupEntryIndex === -1 && this.internalTrack.fragmentLookupTable.length > 0) {
+			lookupEntryIndex = 0;
+		}
+
 		const lookupEntry = lookupEntryIndex !== -1
 			? this.internalTrack.fragmentLookupTable[lookupEntryIndex]!
 			: null;
@@ -2866,7 +3116,9 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			// Load the header
 			let slice = demuxer.reader.requestSliceRange(currentPos, MIN_BOX_HEADER_SIZE, MAX_BOX_HEADER_SIZE);
 			if (slice instanceof Promise) slice = await slice;
-			if (!slice) break;
+			if (!slice) {
+				break;
+			}
 
 			const boxStartPos = currentPos;
 			const boxInfo = readBoxHeader(slice);
@@ -2896,11 +3148,16 @@ abstract class IsobmffTrackBacking implements InputTrackBacking {
 			const previousLookupEntry = this.internalTrack.fragmentLookupTable[lookupEntryIndex - 1];
 			assert(!previousLookupEntry || previousLookupEntry.timestamp < lookupEntry.timestamp);
 
-			const newSearchTimestamp = previousLookupEntry?.timestamp ?? -Infinity;
+			// If there's no previous entry (we're already at index 0), don't recurse - just return null.
+			// This can happen in live streams when the sliding window has moved past the requested timestamp.
+			if (!previousLookupEntry) {
+				return null;
+			}
+
 			return this.performFragmentedLookup(
 				null,
 				getMatchInFragment,
-				newSearchTimestamp,
+				previousLookupEntry.timestamp,
 				latestTimestamp,
 				options,
 			);

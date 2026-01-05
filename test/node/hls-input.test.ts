@@ -288,7 +288,7 @@ describe('HlsInput', () => {
 			expect(duration).toBe(15.5); // 6 + 5.5 + 4
 		});
 
-		it('should return Infinity for live streams', async () => {
+		it('should return current available duration for live streams', async () => {
 			const mediaContent = [
 				'#EXTM3U',
 				'#EXT-X-VERSION:7',
@@ -318,7 +318,9 @@ describe('HlsInput', () => {
 			const input = new HlsInput('https://example.com/live.m3u8', { fetch: mockFetch });
 			const duration = await input.computeDuration();
 
-			expect(duration).toBe(Infinity);
+			// Live streams return the current available duration (not Infinity)
+			// This allows the player to track the growing duration as new segments are added
+			expect(duration).toBe(6);
 		});
 	});
 

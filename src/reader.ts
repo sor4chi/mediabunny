@@ -7,7 +7,7 @@
  */
 
 import { InputDisposedError } from './input';
-import { assert, clamp, getUint24, MaybePromise, toDataView } from './misc';
+import { clamp, getUint24, MaybePromise, toDataView } from './misc';
 import { Source } from './source';
 
 export class Reader {
@@ -63,7 +63,11 @@ export class Reader {
 				}
 
 				const handleFileSize = (fileSize: number | null) => {
-					assert(fileSize !== null); // The slice couldn't fit, meaning we must know the file size now
+					// For unsized sources (like HLS live streams), null means the data
+					// is simply not available - don't retry, just return null
+					if (fileSize === null) {
+						return null;
+					}
 
 					return this.requestSlice(
 						start,

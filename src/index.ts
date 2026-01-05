@@ -196,6 +196,7 @@ export {
 	HlsInput,
 	HlsInputOptions,
 	HlsVariant,
+	HlsLiveEdgeError,
 	parsePlaylist,
 	parseMasterPlaylist,
 	parseMediaPlaylist,

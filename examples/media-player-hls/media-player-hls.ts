@@ -5,6 +5,7 @@
 import {
 	HlsInput,
 	HlsVariant,
+	HlsLiveEdgeError,
 	CanvasSink,
 	AudioBufferSink,
 	WrappedAudioBuffer,
@@ -74,6 +75,11 @@ let volume = 0.7;
 let draggingVolumeBar = false;
 let volumeMuted = false;
 
+// Live stream edge detection
+let liveEdgeCheckInterval: number | null = null;
+let targetDuration = 0;
+let isHandlingLiveEdge = false;
+
 /** === INIT LOGIC === */
 
 const initMediaPlayer = async (hlsUrl: string, selectedVariant?: HlsVariant) => {
@@ -81,6 +87,10 @@ const initMediaPlayer = async (hlsUrl: string, selectedVariant?: HlsVariant) => 
 		if (playing) {
 			pause();
 		}
+
+		// Stop live edge checking from previous session
+		stopLiveEdgeCheck();
+		isHandlingLiveEdge = false;
 
 		void videoFrameIterator?.return();
 		void audioBufferIterator?.return();
@@ -124,9 +134,6 @@ const initMediaPlayer = async (hlsUrl: string, selectedVariant?: HlsVariant) => 
 		const videoTrack = await hlsInput.getPrimaryVideoTrack();
 		const audioTrack = await hlsInput.getPrimaryAudioTrack();
 
-		console.log('Has video track:', !!videoTrack);
-		console.log('Has audio track:', !!audioTrack);
-
 		if (!videoTrack && !audioTrack) {
 			throw new Error('No video or audio track found');
 		}
@@ -134,18 +141,17 @@ const initMediaPlayer = async (hlsUrl: string, selectedVariant?: HlsVariant) => 
 		totalDuration = await hlsInput.computeDuration();
 		isLiveStream = await hlsInput.isLive();
 
-		// For live streams, start near the live edge (3×targetDuration before end per HLS spec)
+		// For live streams, start at 3×targetDuration from the live edge (RFC 8216 recommendation)
 		// For VOD, start from the beginning
 		if (isLiveStream) {
-			const targetDuration = await hlsInput.getTargetDuration();
+			targetDuration = await hlsInput.getTargetDuration();
 			playbackTimeAtStart = Math.max(0, totalDuration - 3 * targetDuration);
+			// Start live edge monitoring
+			startLiveEdgeCheck();
 		} else {
 			playbackTimeAtStart = 0;
+			stopLiveEdgeCheck();
 		}
-
-		console.log('Is live stream:', isLiveStream);
-		console.log('Duration:', totalDuration);
-		console.log('Playback start time:', playbackTimeAtStart);
 
 		// Show live indicator for live streams
 		if (isLiveStream) {
@@ -213,7 +219,6 @@ const initMediaPlayer = async (hlsUrl: string, selectedVariant?: HlsVariant) => 
 		controlsElement.style.pointerEvents = '';
 		playerContainer.style.cursor = '';
 	} catch (error) {
-		console.error(error);
 		errorElement.textContent = String(error);
 		loadingElement.style.display = 'none';
 		playerContainer.style.display = 'none';
@@ -259,7 +264,6 @@ const render = (requestFrame = true) => {
 			context.clearRect(0, 0, canvas.width, canvas.height);
 			context.drawImage(nextFrame.canvas, 0, 0, canvas.width, canvas.height);
 			nextFrame = null;
-
 			void updateNextFrame();
 		}
 
@@ -278,93 +282,151 @@ render();
 
 setInterval(() => render(false), 500);
 
-const updateNextFrame = async () => {
-	if (!videoFrameIterator) return;
+const updateNextFrame = async (retryCount = 0) => {
+	if (!videoFrameIterator) {
+		return;
+	}
 
 	const currentAsyncId = asyncId;
 
-	while (true) {
-		const newNextFrame = (await videoFrameIterator.next()).value ?? null;
-		if (!newNextFrame) {
-			break;
+	try {
+		// Limit how many frames we can skip in one call to prevent tight loops
+		// when playback falls behind (which causes CPU/memory pressure)
+		let framesProcessed = 0;
+		const maxFramesToProcess = 30; // ~1 second at 30fps
+
+		while (framesProcessed < maxFramesToProcess) {
+			const newNextFrame = (await videoFrameIterator.next()).value ?? null;
+			if (!newNextFrame) {
+				// For live streams, the iterator may temporarily run out of data
+				// Wait a bit and retry by restarting the iterator
+				if (isLiveStream && playing && currentAsyncId === asyncId && retryCount < 10) {
+					await new Promise(r => setTimeout(r, 200));
+					if (playing && currentAsyncId === asyncId) {
+						await startVideoIterator();
+						return updateNextFrame(retryCount + 1);
+					}
+				}
+				break;
+			}
+
+			framesProcessed++;
+
+			if (currentAsyncId !== asyncId) {
+				break;
+			}
+
+			const playbackTime = getPlaybackTime();
+			if (newNextFrame.timestamp <= playbackTime) {
+				context.clearRect(0, 0, canvas.width, canvas.height);
+				context.drawImage(newNextFrame.canvas, 0, 0, canvas.width, canvas.height);
+			} else {
+				nextFrame = newNextFrame;
+				break;
+			}
 		}
 
+		// If we hit the limit, yield to the browser and continue
+		if (framesProcessed >= maxFramesToProcess && playing && currentAsyncId === asyncId) {
+			await new Promise(r => setTimeout(r, 0));
+			return updateNextFrame(0);
+		}
+	} catch (error) {
 		if (currentAsyncId !== asyncId) {
-			break;
+			return;
 		}
 
-		const playbackTime = getPlaybackTime();
-		if (newNextFrame.timestamp <= playbackTime) {
-			context.clearRect(0, 0, canvas.width, canvas.height);
-			context.drawImage(newNextFrame.canvas, 0, 0, canvas.width, canvas.height);
+		if (error instanceof HlsLiveEdgeError && isLiveStream) {
+			await handleLiveEdgeError();
 		} else {
-			nextFrame = newNextFrame;
-			break;
+			if (retryCount < 3 && playing && currentAsyncId === asyncId) {
+				await new Promise(r => setTimeout(r, 500));
+				if (playing && currentAsyncId === asyncId) {
+					await startVideoIterator();
+					return updateNextFrame(retryCount + 1);
+				}
+			} else {
+				errorElement.textContent = `Video playback error: ${String(error)}`;
+			}
 		}
 	}
 };
 
 /** === AUDIO PLAYBACK LOGIC === */
 
-const runAudioIterator = async () => {
+const runAudioIterator = async (retryCount = 0) => {
 	if (!audioSink) {
-		console.log('No audio sink available');
 		return;
 	}
 
-	console.log('Starting audio iterator');
 	const currentAsyncId = asyncId;
-	let bufferCount = 0;
 
-	for await (const { buffer, timestamp } of audioBufferIterator!) {
-		if (currentAsyncId !== asyncId) break;
-		if (!playing) break;
+	try {
+		for await (const { buffer, timestamp } of audioBufferIterator!) {
+			if (currentAsyncId !== asyncId) {
+				break;
+			}
+			if (!playing) {
+				break;
+			}
 
-		bufferCount++;
-		if (bufferCount <= 3) {
-			console.log(
-				`Audio buffer ${bufferCount}: timestamp=${timestamp.toFixed(3)}s, `
-				+ `duration=${buffer.duration.toFixed(3)}s, channels=${buffer.numberOfChannels}`,
-			);
-		}
+			const node = audioContext!.createBufferSource();
+			node.buffer = buffer;
+			node.connect(gainNode!);
 
-		const node = audioContext!.createBufferSource();
-		node.buffer = buffer;
-		node.connect(gainNode!);
+			const startTimestamp = audioContextStartTime! + timestamp - playbackTimeAtStart;
 
-		const startTimestamp = audioContextStartTime! + timestamp - playbackTimeAtStart;
-
-		if (startTimestamp >= audioContext!.currentTime) {
-			node.start(startTimestamp);
-		} else {
-			const offset = audioContext!.currentTime - startTimestamp;
-			if (offset < buffer.duration) {
-				node.start(audioContext!.currentTime, offset);
+			if (startTimestamp >= audioContext!.currentTime) {
+				node.start(startTimestamp);
 			} else {
-				continue;
+				const offset = audioContext!.currentTime - startTimestamp;
+				if (offset < buffer.duration) {
+					node.start(audioContext!.currentTime, offset);
+				} else {
+					continue;
+				}
+			}
+
+			queuedAudioNodes.add(node);
+			node.onended = () => {
+				queuedAudioNodes.delete(node);
+			};
+
+			if (timestamp - getPlaybackTime() >= 2) {
+				await new Promise<void>((resolve) => {
+					const checkInterval = () => {
+						if (currentAsyncId !== asyncId || !playing) {
+							resolve();
+							return;
+						}
+						if (timestamp - getPlaybackTime() < 1) {
+							resolve();
+						} else {
+							setTimeout(checkInterval, 100);
+						}
+					};
+					setTimeout(checkInterval, 100);
+				});
 			}
 		}
+	} catch (error) {
+		if (currentAsyncId !== asyncId) {
+			return;
+		}
 
-		queuedAudioNodes.add(node);
-		node.onended = () => {
-			queuedAudioNodes.delete(node);
-		};
-
-		if (timestamp - getPlaybackTime() >= 2) {
-			await new Promise<void>((resolve) => {
-				const checkInterval = () => {
-					if (currentAsyncId !== asyncId || !playing) {
-						resolve();
-						return;
-					}
-					if (timestamp - getPlaybackTime() < 1) {
-						resolve();
-					} else {
-						setTimeout(checkInterval, 100);
-					}
-				};
-				setTimeout(checkInterval, 100);
-			});
+		if (error instanceof HlsLiveEdgeError && isLiveStream) {
+			await handleLiveEdgeError();
+		} else {
+			if (retryCount < 3 && playing && currentAsyncId === asyncId) {
+				await new Promise(r => setTimeout(r, 500));
+				if (playing && currentAsyncId === asyncId) {
+					void audioBufferIterator?.return();
+					audioBufferIterator = audioSink.buffers(getPlaybackTime());
+					return runAudioIterator(retryCount + 1);
+				}
+			} else {
+				errorElement.textContent = `Audio playback error: ${String(error)}`;
+			}
 		}
 	}
 };
@@ -397,9 +459,7 @@ const play = async () => {
 	if (audioSink) {
 		void audioBufferIterator?.return();
 		audioBufferIterator = audioSink.buffers(getPlaybackTime());
-		runAudioIterator().catch((err) => {
-			console.error('Audio iterator error:', err);
-		});
+		void runAudioIterator();
 	}
 
 	playIcon.style.display = 'none';
@@ -446,6 +506,100 @@ const seekToTime = async (seconds: number) => {
 
 	if (wasPlaying && playbackTimeAtStart < totalDuration) {
 		void play();
+	}
+};
+
+/** === LIVE EDGE DETECTION === */
+
+/**
+ * Starts periodic checking for live edge proximity.
+ * If playback gets too close to the live edge, automatically seek back.
+ */
+const startLiveEdgeCheck = () => {
+	stopLiveEdgeCheck();
+
+	// Check every 2 seconds
+	liveEdgeCheckInterval = window.setInterval(() => {
+		void checkLiveEdge();
+	}, 2000);
+};
+
+const stopLiveEdgeCheck = () => {
+	if (liveEdgeCheckInterval !== null) {
+		clearInterval(liveEdgeCheckInterval);
+		liveEdgeCheckInterval = null;
+	}
+};
+
+/**
+ * Check if we're approaching the live edge and rebuffer if needed.
+ */
+const checkLiveEdge = async () => {
+	if (!hlsInput || !isLiveStream || !playing) return;
+
+	try {
+		// Get the current live duration
+		const currentDuration = await hlsInput.computeDuration();
+		totalDuration = currentDuration;
+
+		const currentTime = getPlaybackTime();
+		const distanceFromEdge = currentDuration - currentTime;
+
+		// If within 1.5 segments of the live edge, seek back to 3 segments behind (RFC 8216)
+		const safeDistance = 1.5 * targetDuration;
+		const targetDistance = 3 * targetDuration;
+
+		if (distanceFromEdge < safeDistance) {
+			const newPosition = Math.max(0, currentDuration - targetDistance);
+
+			// Show a brief warning to the user
+			warningElement.textContent = 'Rebuffering...';
+			setTimeout(() => {
+				warningElement.textContent = '';
+			}, 2000);
+
+			await seekToTime(newPosition);
+		}
+	} catch {
+		// Ignore errors during live edge check
+	}
+};
+
+/**
+ * Handle HlsLiveEdgeError by seeking back to a safe position.
+ * This is called when video or audio iterators hit the live edge.
+ * Uses a debounce flag to prevent multiple concurrent seekbacks.
+ */
+const handleLiveEdgeError = async () => {
+	if (!hlsInput || !isLiveStream) return;
+
+	// Debounce: prevent multiple concurrent calls from audio/video iterators
+	if (isHandlingLiveEdge) {
+		return;
+	}
+	isHandlingLiveEdge = true;
+
+	try {
+		const currentDuration = await hlsInput.computeDuration();
+		totalDuration = currentDuration;
+
+		const targetDistance = 3 * targetDuration;
+		const newPosition = Math.max(0, currentDuration - targetDistance);
+
+		// Show a brief warning to the user
+		warningElement.textContent = 'Rebuffering...';
+		setTimeout(() => {
+			warningElement.textContent = '';
+		}, 2000);
+
+		await seekToTime(newPosition);
+	} catch {
+		// Ignore errors during live edge handling
+	} finally {
+		// Reset the flag after a short delay to allow new edge handling
+		setTimeout(() => {
+			isHandlingLiveEdge = false;
+		}, 500);
 	}
 };
 
@@ -643,9 +797,7 @@ fullscreenButton.addEventListener('click', () => {
 	if (document.fullscreenElement) {
 		void document.exitFullscreen();
 	} else {
-		playerContainer.requestFullscreen().catch((e) => {
-			console.error('Failed to enter fullscreen mode:', e);
-		});
+		void playerContainer.requestFullscreen();
 	}
 });
 

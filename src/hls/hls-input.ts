@@ -394,18 +394,24 @@ export class HlsInput implements Disposable {
 	/**
 	 * Computes the duration of available content in seconds.
 	 * For VOD streams, this is the total duration.
-	 * For live streams, this is the duration of the current sliding window.
+	 * For live streams, this returns the current total duration which grows as new segments are added.
 	 */
 	async computeDuration(): Promise<number> {
 		// Ensure we have the media playlist loaded
 		await this.getInput();
+
+		// For live streams, get the live duration from the source
+		// which updates as new segments are added
+		if (this.selectedInput) {
+			return await this.selectedInput.getLiveDuration();
+		}
 
 		const playlist = this._currentMediaPlaylist;
 		if (!playlist) {
 			return 0;
 		}
 
-		// Sum up all segment durations from the manifest
+		// Fallback: sum up all segment durations from the manifest
 		return playlist.segments.reduce((sum, segment) => sum + segment.duration, 0);
 	}
 
