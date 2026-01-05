@@ -374,6 +374,39 @@ export class IsobmffDemuxer extends Demuxer {
 		}
 	}
 
+	/**
+	 * Appends new fragments to the lookup table for live streams.
+	 * This is called when new segments are discovered during playlist refresh.
+	 * The timestamps include editListOffset since this is called after normalization.
+	 *
+	 * @param segments Array of new segment info containing duration (in seconds) and virtual byte offset
+	 * @param startTimeSeconds The cumulative time (in seconds) at which these new segments start
+	 * @internal
+	 */
+	appendFragmentsToLookupTable(
+		segments: Array<{ durationSeconds: number; moofOffset: number }>,
+		startTimeSeconds: number,
+	): void {
+		let cumulativeTimeSeconds = startTimeSeconds;
+
+		for (const segment of segments) {
+			for (const track of this.tracks) {
+				// Convert cumulative time from seconds to track timescale
+				// Include editListOffset since we're called after normalization
+				const timestampInTimescale = Math.round(cumulativeTimeSeconds * track.timescale) + track.editListOffset;
+
+				track.fragmentLookupTable.push({
+					timestamp: timestampInTimescale,
+					moofOffset: segment.moofOffset,
+				});
+			}
+
+			cumulativeTimeSeconds += segment.durationSeconds;
+		}
+
+		// Lookup tables remain sorted since we're appending new (later) segments
+	}
+
 	readMetadata() {
 		return this.metadataPromise ??= (async () => {
 			let currentPos = 0;

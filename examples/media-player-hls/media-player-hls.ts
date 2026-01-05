@@ -11,12 +11,17 @@ import {
 	WrappedCanvas,
 } from 'mediabunny';
 
-// Sample HLS stream (Apple's fMP4 HLS test stream with muxed audio)
-const SAMPLE_HLS_URL
+// Sample HLS streams
+const SAMPLE_VOD_URL
 	= 'https://devstreaming-cdn.apple.com/videos/streaming/examples/img_bipbop_adv_example_fmp4/master.m3u8';
+
+// SomaFM live fMP4 HLS stream (audio-only, but demonstrates live capability)
+const SAMPLE_LIVE_URL
+	= 'https://hls.somafm.com/hls/groovesalad/320k/program.m3u8';
 
 const loadUrlButton = document.querySelector('#load-url') as HTMLButtonElement;
 const loadSampleButton = document.querySelector('#load-sample') as HTMLButtonElement;
+const loadLiveButton = document.querySelector('#load-live') as HTMLButtonElement;
 const fileNameElement = document.querySelector('#file-name') as HTMLParagraphElement;
 const horizontalRule = document.querySelector('hr') as HTMLHRElement;
 const qualitySelector = document.querySelector('#quality-selector') as HTMLDivElement;
@@ -38,7 +43,7 @@ const volumeButton = document.querySelector('#volume-button') as HTMLButtonEleme
 const fullscreenButton = document.querySelector('#fullscreen-button') as HTMLButtonElement;
 const errorElement = document.querySelector('#error-element') as HTMLDivElement;
 const warningElement = document.querySelector('#warning-element') as HTMLDivElement;
-const liveBadge = document.querySelector('#live-badge') as HTMLDivElement;
+const liveIndicator = document.querySelector('#live-indicator') as HTMLSpanElement;
 
 const context = canvas.getContext('2d')!;
 
@@ -52,6 +57,7 @@ let videoSink: CanvasSink | null = null;
 let audioSink: AudioBufferSink | null = null;
 
 let totalDuration = 0;
+let isLiveStream = false;
 let audioContextStartTime: number | null = null;
 let playing = false;
 let playbackTimeAtStart = 0;
@@ -85,7 +91,7 @@ const initMediaPlayer = async (hlsUrl: string, selectedVariant?: HlsVariant) => 
 		horizontalRule.style.display = '';
 		loadingElement.style.display = '';
 		playerContainer.style.display = 'none';
-		liveBadge.style.display = 'none';
+		liveIndicator.style.display = 'none';
 		errorElement.textContent = '';
 		warningElement.textContent = '';
 
@@ -96,6 +102,9 @@ const initMediaPlayer = async (hlsUrl: string, selectedVariant?: HlsVariant) => 
 			hlsInput = new HlsInput(hlsUrl);
 			currentHlsUrl = hlsUrl;
 			qualitySelector.style.display = 'none';
+		}
+		if (!hlsInput) {
+			throw new Error('Failed to create HlsInput');
 		}
 
 		// Get available variants
@@ -118,13 +127,37 @@ const initMediaPlayer = async (hlsUrl: string, selectedVariant?: HlsVariant) => 
 		console.log('Has video track:', !!videoTrack);
 		console.log('Has audio track:', !!audioTrack);
 
-		if (!videoTrack) {
-			throw new Error('No video track found');
+		if (!videoTrack && !audioTrack) {
+			throw new Error('No video or audio track found');
 		}
 
-		playbackTimeAtStart = 0;
 		totalDuration = await hlsInput.computeDuration();
-		durationElement.textContent = formatSeconds(totalDuration);
+		isLiveStream = await hlsInput.isLive();
+
+		// For live streams, start near the live edge (3×targetDuration before end per HLS spec)
+		// For VOD, start from the beginning
+		if (isLiveStream) {
+			const targetDuration = await hlsInput.getTargetDuration();
+			playbackTimeAtStart = Math.max(0, totalDuration - 3 * targetDuration);
+		} else {
+			playbackTimeAtStart = 0;
+		}
+
+		console.log('Is live stream:', isLiveStream);
+		console.log('Duration:', totalDuration);
+		console.log('Playback start time:', playbackTimeAtStart);
+
+		// Show live indicator for live streams
+		if (isLiveStream) {
+			liveIndicator.style.display = 'flex';
+			durationElement.style.display = 'none';
+			progressBarContainer.style.display = 'none';
+		} else {
+			liveIndicator.style.display = 'none';
+			durationElement.style.display = '';
+			durationElement.textContent = formatSeconds(totalDuration);
+			progressBarContainer.style.display = '';
+		}
 
 		// eslint-disable-next-line @typescript-eslint/no-explicit-any, @typescript-eslint/no-unsafe-member-access
 		const AudioContextClass = window.AudioContext || (window as any).webkitAudioContext;
@@ -134,14 +167,26 @@ const initMediaPlayer = async (hlsUrl: string, selectedVariant?: HlsVariant) => 
 		gainNode.connect(audioContext.destination);
 		updateVolume();
 
-		videoSink = new CanvasSink(videoTrack, {
-			poolSize: 2,
-			fit: 'contain',
-		});
+		if (videoTrack) {
+			videoSink = new CanvasSink(videoTrack, {
+				poolSize: 2,
+				fit: 'contain',
+			});
+			canvas.width = videoTrack.displayWidth;
+			canvas.height = videoTrack.displayHeight;
+		} else {
+			videoSink = null;
+			// Audio-only: show placeholder
+			canvas.width = 640;
+			canvas.height = 360;
+			context.fillStyle = '#18181b';
+			context.fillRect(0, 0, canvas.width, canvas.height);
+			context.fillStyle = '#a855f7';
+			context.font = 'bold 24px sans-serif';
+			context.textAlign = 'center';
+			context.fillText('♪ Audio Only', canvas.width / 2, canvas.height / 2);
+		}
 		audioSink = audioTrack ? new AudioBufferSink(audioTrack) : null;
-
-		canvas.width = videoTrack.displayWidth;
-		canvas.height = videoTrack.displayHeight;
 
 		if (audioTrack) {
 			volumeButton.style.display = '';
@@ -153,7 +198,9 @@ const initMediaPlayer = async (hlsUrl: string, selectedVariant?: HlsVariant) => 
 
 		fileLoaded = true;
 
-		await startVideoIterator();
+		if (videoSink) {
+			await startVideoIterator();
+		}
 
 		if (audioContext.state === 'running') {
 			await play();
@@ -201,12 +248,14 @@ const render = (requestFrame = true) => {
 	if (fileLoaded) {
 		const playbackTime = getPlaybackTime();
 
-		if (playbackTime >= totalDuration) {
+		// Don't pause at end for live streams
+		if (!isLiveStream && playbackTime >= totalDuration) {
 			pause();
 			playbackTimeAtStart = totalDuration;
 		}
 
-		if (nextFrame && nextFrame.timestamp <= playbackTime) {
+		// Only render video if we have a video sink
+		if (videoSink && nextFrame && nextFrame.timestamp <= playbackTime) {
 			context.clearRect(0, 0, canvas.width, canvas.height);
 			context.drawImage(nextFrame.canvas, 0, 0, canvas.width, canvas.height);
 			nextFrame = null;
@@ -214,8 +263,10 @@ const render = (requestFrame = true) => {
 			void updateNextFrame();
 		}
 
-		if (!draggingProgressBar) {
+		if (!draggingProgressBar && !isLiveStream) {
 			updateProgressBarTime(playbackTime);
+		} else if (isLiveStream) {
+			currentTimeElement.textContent = formatSeconds(playbackTime);
 		}
 	}
 
@@ -228,10 +279,12 @@ render();
 setInterval(() => render(false), 500);
 
 const updateNextFrame = async () => {
+	if (!videoFrameIterator) return;
+
 	const currentAsyncId = asyncId;
 
 	while (true) {
-		const newNextFrame = (await videoFrameIterator!.next()).value ?? null;
+		const newNextFrame = (await videoFrameIterator.next()).value ?? null;
 		if (!newNextFrame) {
 			break;
 		}
@@ -269,7 +322,10 @@ const runAudioIterator = async () => {
 
 		bufferCount++;
 		if (bufferCount <= 3) {
-			console.log(`Audio buffer ${bufferCount}: timestamp=${timestamp.toFixed(3)}s, duration=${buffer.duration.toFixed(3)}s, channels=${buffer.numberOfChannels}`);
+			console.log(
+				`Audio buffer ${bufferCount}: timestamp=${timestamp.toFixed(3)}s, `
+				+ `duration=${buffer.duration.toFixed(3)}s, channels=${buffer.numberOfChannels}`,
+			);
 		}
 
 		const node = audioContext!.createBufferSource();
@@ -328,9 +384,11 @@ const play = async () => {
 		await audioContext!.resume();
 	}
 
-	if (getPlaybackTime() >= totalDuration) {
+	if (!isLiveStream && getPlaybackTime() >= totalDuration) {
 		playbackTimeAtStart = 0;
-		await startVideoIterator();
+		if (videoSink) {
+			await startVideoIterator();
+		}
 	}
 
 	audioContextStartTime = audioContext!.currentTime;
@@ -382,7 +440,9 @@ const seekToTime = async (seconds: number) => {
 
 	playbackTimeAtStart = seconds;
 
-	await startVideoIterator();
+	if (videoSink) {
+		await startVideoIterator();
+	}
 
 	if (wasPlaying && playbackTimeAtStart < totalDuration) {
 		void play();
@@ -656,5 +716,9 @@ loadUrlButton.addEventListener('click', () => {
 });
 
 loadSampleButton.addEventListener('click', () => {
-	void initMediaPlayer(SAMPLE_HLS_URL);
+	void initMediaPlayer(SAMPLE_VOD_URL);
+});
+
+loadLiveButton.addEventListener('click', () => {
+	void initMediaPlayer(SAMPLE_LIVE_URL);
 });

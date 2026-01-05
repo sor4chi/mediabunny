@@ -16,13 +16,17 @@
 		<p class="max-w-lg text-center">Load an HLS stream (.m3u8), and a fully custom, Mediabunny-powered player will appear.</p>
 
 		<div class="flex flex-col items-center gap-1">
-			<div class="flex gap-2 mt-4">
+			<div class="flex gap-2 mt-4 flex-wrap justify-center">
 				<button id="load-url" class="rounded-lg bg-zinc-200 dark:bg-zinc-750 hover:bg-zinc-300 dark:hover:bg-zinc-700 px-5 py-2">
 					Load HLS URL
 				</button>
 
 				<button id="load-sample" class="rounded-lg bg-purple-500 hover:bg-purple-600 text-white px-5 py-2">
-					Load sample stream
+					Load VOD sample
+				</button>
+
+				<button id="load-live" class="rounded-lg bg-red-500 hover:bg-red-600 text-white px-5 py-2">
+					Load Live sample
 				</button>
 			</div>
 
@@ -78,6 +82,7 @@
 					</div>
 				</div>
 
+				<span id="live-indicator" class="hidden text-sm text-red-500 mx-2">Live Broadcast</span>
 				<p id="duration" class="tabular-nums w-10 sm:w-24 text-sm"></p>
 
 				<button class="p-2 group outline-none" id="fullscreen-button">
@@ -87,9 +92,6 @@
 				</button>
 			</div>
 
-			<div id="live-badge" class="absolute top-2 right-2 bg-red-500 text-white text-xs px-2 py-1 rounded" style="display: none;">
-				LIVE
-			</div>
 		</div>
 
 		<a href="/" class="fixed top-0 left-0 flex gap-2 py-2 px-5 items-center">

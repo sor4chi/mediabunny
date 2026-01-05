@@ -138,8 +138,8 @@ describe('HlsSegmentSource', () => {
 
 		it('should correctly calculate segment offsets with BYTERANGE', async () => {
 			const playlist = createPlaylist([
-				{ length: 500, offset: 100 },  // segment 0: virtual 100-600
-				{ length: 700, offset: 600 },  // segment 1: virtual 600-1300
+				{ length: 500, offset: 100 }, // segment 0: virtual 100-600
+				{ length: 700, offset: 600 }, // segment 1: virtual 600-1300
 				{ length: 800, offset: 1300 }, // segment 2: virtual 1300-2100
 			]);
 			// init=0-100
@@ -616,7 +616,8 @@ describe('HlsSegmentSource', () => {
 			const source = new HlsSegmentSource(playlist, 'http://example.com/', mockFetch);
 
 			// Try to read from segment range
-			await expect(source._read(150, 200)).rejects.toThrow('Failed to fetch segment 0');
+			// Media sequence starts at 1, so first segment has sequence 1
+			await expect(source._read(150, 200)).rejects.toThrow('Failed to fetch segment 1');
 		});
 
 		it('should handle network errors gracefully', async () => {
@@ -645,7 +646,7 @@ describe('HlsSegmentSource', () => {
 	});
 
 	describe('Segment cache eviction', () => {
-		it('should evict old segments when cache exceeds 5 entries', async () => {
+		it('should evict old segments when cache exceeds 10 entries', async () => {
 			const fetchedSegments: number[] = [];
 			const mockFetch = vi.fn().mockImplementation((url: string, options?: RequestInit) => {
 				const rangeHeader = (options?.headers as Record<string, string>)?.['Range'];
@@ -671,8 +672,8 @@ describe('HlsSegmentSource', () => {
 				});
 			});
 
-			// Create 10 segments
-			const segments = Array.from({ length: 10 }, (_, i) => ({
+			// Create 15 segments
+			const segments = Array.from({ length: 15 }, (_, i) => ({
 				length: 1000,
 				offset: 100 + i * 1000,
 			}));
@@ -693,8 +694,8 @@ describe('HlsSegmentSource', () => {
 
 			const source = new HlsSegmentSource(playlist, 'http://example.com/', mockFetch);
 
-			// Read from segments 0-7 sequentially
-			for (let i = 0; i < 8; i++) {
+			// Read from segments 0-12 sequentially (13 segments, exceeds cache of 10)
+			for (let i = 0; i < 13; i++) {
 				await source._read(100 + i * 1000 + 100, 100 + i * 1000 + 200);
 			}
 

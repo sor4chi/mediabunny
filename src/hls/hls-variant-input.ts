@@ -11,30 +11,57 @@ import { Mp4InputFormat } from '../input-format';
 import { IsobmffDemuxer } from '../isobmff/isobmff-demuxer';
 import { ReadResult, Source } from '../source';
 import { createFetchHeaders, resolveUrl } from './hls-utils';
-import type { MediaPlaylist } from './m3u8-types';
+import { parsePlaylist } from './m3u8-parser';
+import type { MediaPlaylist, MediaSegment } from './m3u8-types';
+
+/** Segment info tracked by media sequence number. */
+type SegmentInfo = {
+	segment: MediaSegment;
+	offset: { start: number; end: number };
+	mediaSequence: number;
+};
 
 /**
  * A Source that presents HLS fMP4 segments as a virtual continuous byte stream.
+ * Supports live streams with playlist refresh.
  * @internal
  */
 export class HlsSegmentSource extends Source {
 	private mediaPlaylist: MediaPlaylist;
-	private baseUrl: string;
+	private playlistUrl: string;
 	private fetchFn: typeof fetch;
 
 	private initSegmentData: Uint8Array | null = null;
+	/** Segment data cached by media sequence number. */
 	private segmentDataCache: Map<number, Uint8Array> = new Map();
-	private segmentOffsets: { start: number; end: number }[] = [];
+	/** Segment info tracked by media sequence number. */
+	private segmentInfoMap: Map<number, SegmentInfo> = new Map();
+	/** Ordered list of media sequence numbers we know about. */
+	private knownSequences: number[] = [];
 	private initialized = false;
+
+	/** For live streams: refresh timer ID. */
+	private refreshTimer: ReturnType<typeof setTimeout> | null = null;
+	/** For live streams: whether we're currently refreshing. */
+	private isRefreshing = false;
+	/** Tracks the next byte offset for appending new segments. */
+	private nextSegmentOffset = 0;
+	/** Callback to notify when new segments are added (for updating demuxer lookup table). */
+	private onSegmentsAdded:
+		| ((segments: Array<{ durationSeconds: number; moofOffset: number }>, startTimeSeconds: number) => void)
+		| null = null;
+
+	/** Tracks total duration of all known segments for calculating new segment start times. */
+	private totalDurationSeconds = 0;
 
 	constructor(
 		mediaPlaylist: MediaPlaylist,
-		baseUrl: string,
+		playlistUrl: string,
 		fetchFn: typeof fetch,
 	) {
 		super();
 		this.mediaPlaylist = mediaPlaylist;
-		this.baseUrl = baseUrl;
+		this.playlistUrl = playlistUrl;
 		this.fetchFn = fetchFn;
 	}
 
@@ -47,7 +74,7 @@ export class HlsSegmentSource extends Source {
 			throw new Error('HLS stream does not have an init segment (EXT-X-MAP). Only fMP4 HLS is supported.');
 		}
 
-		const initUrl = resolveUrl(firstSegmentWithMap.map.uri, this.baseUrl);
+		const initUrl = resolveUrl(firstSegmentWithMap.map.uri, this.playlistUrl);
 		const initHeaders = createFetchHeaders(firstSegmentWithMap.map.byteRange);
 
 		const initResponse = await this.fetchFn(initUrl, { headers: initHeaders });
@@ -56,92 +83,223 @@ export class HlsSegmentSource extends Source {
 		}
 		this.initSegmentData = new Uint8Array(await initResponse.arrayBuffer());
 
-		// Build segment offset map
-		// If segments have byteRange, we know sizes upfront; otherwise we need to fetch to know
-		const initLength = this.initSegmentData.length;
-		let currentOffset = initLength;
-
-		for (let i = 0; i < this.mediaPlaylist.segments.length; i++) {
-			const seg = this.mediaPlaylist.segments[i]!;
-			if (seg.byteRange) {
-				// Size is known from manifest
-				const segmentSize = seg.byteRange.length;
-				this.segmentOffsets.push({
-					start: currentOffset,
-					end: currentOffset + segmentSize,
-				});
-				currentOffset += segmentSize;
-			} else {
-				// Size unknown until fetched
-				this.segmentOffsets.push({
-					start: currentOffset,
-					end: currentOffset, // Will be updated when fetched
-				});
-			}
-		}
+		// Initialize segment tracking
+		this.nextSegmentOffset = this.initSegmentData.length;
+		this.addSegmentsFromPlaylist(this.mediaPlaylist);
 
 		this.initialized = true;
+
+		// Start refresh timer for live streams
+		if (!this.mediaPlaylist.endList) {
+			this.startRefreshTimer();
+		}
 	}
 
-	private async fetchSegment(index: number): Promise<Uint8Array> {
-		const cached = this.segmentDataCache.get(index);
+	/**
+	 * Adds segments from a playlist to our tracking structures.
+	 * Only adds segments we don't already know about.
+	 * Returns info about newly added segments for updating the demuxer lookup table,
+	 * along with the start time for those new segments.
+	 */
+	private addSegmentsFromPlaylist(
+		playlist: MediaPlaylist,
+	): { newSegments: Array<{ durationSeconds: number; moofOffset: number }>; startTimeSeconds: number } {
+		const baseSequence = playlist.mediaSequence;
+		const newSegments: Array<{ durationSeconds: number; moofOffset: number }> = [];
+		const startTimeSeconds = this.totalDurationSeconds;
+
+		for (let i = 0; i < playlist.segments.length; i++) {
+			const seq = baseSequence + i;
+			const segment = playlist.segments[i]!;
+
+			// Skip if we already have this segment
+			if (this.segmentInfoMap.has(seq)) {
+				continue;
+			}
+
+			// Determine start offset for this new segment
+			// It should chain from the previous segment's end
+			let startOffset: number;
+			if (this.knownSequences.length === 0) {
+				// First segment starts after init
+				startOffset = this.nextSegmentOffset;
+			} else {
+				// Chain to the last known segment's end
+				// (even if that end is unknown, it will be updated when that segment is fetched)
+				const lastSeq = this.knownSequences[this.knownSequences.length - 1]!;
+				const lastInfo = this.segmentInfoMap.get(lastSeq)!;
+				startOffset = lastInfo.offset.end;
+			}
+
+			// Calculate end offset
+			let endOffset = startOffset;
+			if (segment.byteRange) {
+				endOffset = startOffset + segment.byteRange.length;
+			}
+			// For non-byteRange segments, end = start (will be updated when fetched)
+
+			const info: SegmentInfo = {
+				segment,
+				offset: {
+					start: startOffset,
+					end: endOffset,
+				},
+				mediaSequence: seq,
+			};
+
+			this.segmentInfoMap.set(seq, info);
+			this.knownSequences.push(seq);
+
+			// Track new segment for lookup table update
+			newSegments.push({
+				durationSeconds: segment.duration,
+				moofOffset: startOffset,
+			});
+
+			// Update nextSegmentOffset and total duration
+			this.nextSegmentOffset = endOffset;
+			this.totalDurationSeconds += segment.duration;
+		}
+
+		return { newSegments, startTimeSeconds };
+	}
+
+	/**
+	 * Starts the playlist refresh timer for live streams.
+	 */
+	private startRefreshTimer(): void {
+		if (this.refreshTimer) return;
+
+		// Refresh at half the target duration (HLS spec recommendation)
+		const refreshInterval = (this.mediaPlaylist.targetDuration / 2) * 1000;
+
+		this.refreshTimer = setTimeout(() => {
+			this.refreshTimer = null;
+			void this.refreshPlaylist();
+		}, refreshInterval);
+	}
+
+	/**
+	 * Refreshes the playlist for live streams.
+	 */
+	private async refreshPlaylist(): Promise<void> {
+		if (this.isRefreshing || this._disposed) return;
+		this.isRefreshing = true;
+
+		try {
+			const response = await this.fetchFn(this.playlistUrl);
+			if (!response.ok) {
+				console.warn(`Failed to refresh HLS playlist: ${response.status}`);
+				return;
+			}
+
+			const text = await response.text();
+			const playlist = parsePlaylist(text);
+
+			if (playlist.type !== 'media') {
+				console.warn('Expected media playlist but got master playlist during refresh');
+				return;
+			}
+
+			// Update our playlist reference
+			this.mediaPlaylist = playlist;
+
+			// Add any new segments
+			const { newSegments, startTimeSeconds } = this.addSegmentsFromPlaylist(playlist);
+
+			// Notify callback so demuxer lookup table can be updated
+			if (newSegments.length > 0 && this.onSegmentsAdded) {
+				this.onSegmentsAdded(newSegments, startTimeSeconds);
+			}
+
+			// Evict old segment data from cache (keep last 10 sequences)
+			this.evictOldSegments();
+
+			// Schedule next refresh if still live
+			if (!playlist.endList && !this._disposed) {
+				this.startRefreshTimer();
+			}
+		} catch (error) {
+			console.warn('Error refreshing HLS playlist:', error);
+			// Retry after target duration
+			if (!this._disposed) {
+				this.startRefreshTimer();
+			}
+		} finally {
+			this.isRefreshing = false;
+		}
+	}
+
+	/**
+	 * Evicts old segment data from cache to save memory.
+	 */
+	private evictOldSegments(): void {
+		const maxCached = 10;
+		if (this.segmentDataCache.size <= maxCached) return;
+
+		const sortedKeys = [...this.segmentDataCache.keys()].sort((a, b) => a - b);
+		const toRemove = sortedKeys.slice(0, sortedKeys.length - maxCached);
+
+		for (const key of toRemove) {
+			this.segmentDataCache.delete(key);
+		}
+	}
+
+	/**
+	 * Fetches a segment by its media sequence number.
+	 */
+	private async fetchSegmentBySequence(mediaSequence: number): Promise<Uint8Array> {
+		const cached = this.segmentDataCache.get(mediaSequence);
 		if (cached) {
 			return cached;
 		}
 
-		const segment = this.mediaPlaylist.segments[index];
-		if (!segment) {
-			throw new Error(`Segment ${index} not found.`);
+		const info = this.segmentInfoMap.get(mediaSequence);
+		if (!info) {
+			throw new Error(`Segment with media sequence ${mediaSequence} not found.`);
 		}
 
-		const segmentUrl = resolveUrl(segment.uri, this.baseUrl);
-		const headers = createFetchHeaders(segment.byteRange);
+		const segmentUrl = resolveUrl(info.segment.uri, this.playlistUrl);
+		const headers = createFetchHeaders(info.segment.byteRange);
 
 		const response = await this.fetchFn(segmentUrl, { headers });
 		if (!response.ok && response.status !== 206) {
-			throw new Error(`Failed to fetch segment ${index}: ${response.status}`);
+			throw new Error(`Failed to fetch segment ${mediaSequence}: ${response.status}`);
 		}
 
 		const data = new Uint8Array(await response.arrayBuffer());
-		this.segmentDataCache.set(index, data);
+		this.segmentDataCache.set(mediaSequence, data);
 
-		// Update offsets for this and subsequent segments
-		const offset = this.segmentOffsets[index]!;
-		offset.end = offset.start + data.length;
+		// Update offset end for this segment
+		info.offset.end = info.offset.start + data.length;
 
 		// Update subsequent segment starts (only for non-BYTERANGE streams)
-		// For BYTERANGE streams, offsets are already correctly calculated in initialize()
-		const seg = this.mediaPlaylist.segments[index]!;
-		if (!seg.byteRange) {
-			let nextStart = offset.end;
-			for (let i = index + 1; i < this.segmentOffsets.length; i++) {
-				const nextOffset = this.segmentOffsets[i]!;
-				const nextSeg = this.mediaPlaylist.segments[i]!;
-				// Skip if next segment has BYTERANGE (already has correct offsets)
-				if (nextSeg.byteRange) break;
+		if (!info.segment.byteRange) {
+			let nextStart = info.offset.end;
+			const seqIndex = this.knownSequences.indexOf(mediaSequence);
 
-				const nextData = this.segmentDataCache.get(i);
-				nextOffset.start = nextStart;
+			for (let i = seqIndex + 1; i < this.knownSequences.length; i++) {
+				const nextSeq = this.knownSequences[i]!;
+				const nextInfo = this.segmentInfoMap.get(nextSeq);
+				if (!nextInfo) break;
+
+				// Skip if next segment has BYTERANGE (already has correct offsets)
+				if (nextInfo.segment.byteRange) break;
+
+				const nextData = this.segmentDataCache.get(nextSeq);
+				nextInfo.offset.start = nextStart;
 				if (nextData) {
-					nextOffset.end = nextStart + nextData.length;
-					nextStart = nextOffset.end;
+					nextInfo.offset.end = nextStart + nextData.length;
+					nextStart = nextInfo.offset.end;
 				} else {
-					nextOffset.end = nextStart; // Unknown until fetched
+					nextInfo.offset.end = nextStart; // Unknown until fetched
 					break;
 				}
 			}
 		}
 
-		// Evict old segments to save memory (keep max 5)
-		if (this.segmentDataCache.size > 5) {
-			const keys = [...this.segmentDataCache.keys()].sort((a, b) => a - b);
-			for (const key of keys) {
-				if (key < index - 2) {
-					this.segmentDataCache.delete(key);
-				}
-				if (this.segmentDataCache.size <= 5) break;
-			}
-		}
+		// Evict old segments to save memory
+		this.evictOldSegments();
 
 		return data;
 	}
@@ -182,16 +340,19 @@ export class HlsSegmentSource extends Source {
 			}
 		}
 
-		for (let i = 0; i < this.mediaPlaylist.segments.length; i++) {
+		// Iterate through segments by media sequence number
+		for (const mediaSequence of this.knownSequences) {
 			// Check if we've already fetched enough
 			if (bytesWritten >= requestedLength) break;
 
 			const currentReadStart = start + bytesWritten;
-			const seg = this.mediaPlaylist.segments[i]!;
-			const offset = this.segmentOffsets[i]!;
+			const info = this.segmentInfoMap.get(mediaSequence);
+			if (!info) continue;
+
+			const { segment, offset } = info;
 
 			// If byteRange is present, we know the segment boundaries upfront
-			if (seg.byteRange) {
+			if (segment.byteRange) {
 				// Skip if segment is entirely before read range
 				if (offset.end <= currentReadStart) {
 					continue;
@@ -202,35 +363,30 @@ export class HlsSegmentSource extends Source {
 			} else {
 				// Without byteRange, we need to fetch segments to know their sizes
 				// We can only skip a segment if we've already fetched it AND know its range doesn't overlap
-				if (this.segmentDataCache.has(i)) {
+				if (this.segmentDataCache.has(mediaSequence)) {
 					// Segment already fetched, we know its bounds - skip if entirely before read range
 					if (offset.end <= currentReadStart) {
 						continue;
 					}
 					// Stop if entirely after read range
 					if (offset.start >= end) break;
-				} else if (i > 0) {
+				} else {
 					// Segment not fetched yet - check if all previous segments are fetched
-					// so we know the exact start position of this segment
-					const allPreviousFetched = Array.from(
-						{ length: i },
-						(_, j) => this.segmentDataCache.has(j),
-					).every(Boolean);
+					const seqIndex = this.knownSequences.indexOf(mediaSequence);
+					const allPreviousFetched = this.knownSequences
+						.slice(0, seqIndex)
+						.every(seq => this.segmentDataCache.has(seq));
+
 					if (allPreviousFetched) {
 						// We know this segment's exact start position
-						// Skip only if we're before this segment's start
-						// (We must fetch to know the end)
 						if (offset.start >= end) {
 							break;
 						}
-						// If currentReadStart >= offset.start, we need this segment
-						// If currentReadStart < offset.start, this segment hasn't started yet at our read position
-						// But we still can't skip because we don't know the end
 					}
 				}
 			}
 
-			const segmentData = await this.fetchSegment(i);
+			const segmentData = await this.fetchSegmentBySequence(mediaSequence);
 
 			// Skip if segment is entirely before read range (for non-byteRange case)
 			if (offset.end <= currentReadStart) continue;
@@ -269,8 +425,16 @@ export class HlsSegmentSource extends Source {
 	}
 
 	_dispose(): void {
+		// Stop refresh timer
+		if (this.refreshTimer) {
+			clearTimeout(this.refreshTimer);
+			this.refreshTimer = null;
+		}
+
 		this.initSegmentData = null;
 		this.segmentDataCache.clear();
+		this.segmentInfoMap.clear();
+		this.knownSequences = [];
 	}
 
 	/**
@@ -283,10 +447,13 @@ export class HlsSegmentSource extends Source {
 			throw new Error('Source must be initialized before getting segment lookup info');
 		}
 
-		return this.mediaPlaylist.segments.map((segment, index) => ({
-			durationSeconds: segment.duration,
-			moofOffset: this.segmentOffsets[index]!.start,
-		}));
+		return this.knownSequences.map((seq) => {
+			const info = this.segmentInfoMap.get(seq)!;
+			return {
+				durationSeconds: info.segment.duration,
+				moofOffset: info.offset.start,
+			};
+		});
 	}
 
 	/**
@@ -295,6 +462,20 @@ export class HlsSegmentSource extends Source {
 	 */
 	async ensureInitialized(): Promise<void> {
 		await this.initialize();
+	}
+
+	/**
+	 * Sets a callback to be notified when new segments are added.
+	 * Used by HlsVariantInput to update the demuxer's fragment lookup table.
+	 * @internal
+	 */
+	setOnSegmentsAdded(
+		callback: (
+			segments: Array<{ durationSeconds: number; moofOffset: number }>,
+			startTimeSeconds: number,
+		) => void,
+	): void {
+		this.onSegmentsAdded = callback;
 	}
 }
 
@@ -368,6 +549,11 @@ export class HlsVariantInput extends Input<HlsSegmentSource> {
 				// Adjust lookup table timestamps to match normalized internal timestamps
 				// This must be done AFTER normalization since editListOffset changes
 				demuxer.adjustFragmentLookupTableForEditListOffset();
+
+				// Set up callback to update demuxer when new segments are added (live streams)
+				this._source.setOnSegmentsAdded((segments, startTimeSeconds) => {
+					demuxer.appendFragmentsToLookupTable(segments, startTimeSeconds);
+				});
 			}
 
 			return demuxer;

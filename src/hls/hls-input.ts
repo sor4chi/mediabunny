@@ -392,9 +392,9 @@ export class HlsInput implements Disposable {
 	}
 
 	/**
-	 * Computes the duration of the stream in seconds.
-	 * For HLS, this is calculated from the manifest segment durations (fast, no network requests).
-	 * For live streams (no EXT-X-ENDLIST), returns Infinity.
+	 * Computes the duration of available content in seconds.
+	 * For VOD streams, this is the total duration.
+	 * For live streams, this is the duration of the current sliding window.
 	 */
 	async computeDuration(): Promise<number> {
 		// Ensure we have the media playlist loaded
@@ -403,11 +403,6 @@ export class HlsInput implements Disposable {
 		const playlist = this._currentMediaPlaylist;
 		if (!playlist) {
 			return 0;
-		}
-
-		// Live streams have no defined duration
-		if (!playlist.endList) {
-			return Infinity;
 		}
 
 		// Sum up all segment durations from the manifest
@@ -420,6 +415,16 @@ export class HlsInput implements Disposable {
 	async isLive(): Promise<boolean> {
 		await this.getInput();
 		return this._currentMediaPlaylist ? !this._currentMediaPlaylist.endList : false;
+	}
+
+	/**
+	 * Returns the target duration in seconds (EXT-X-TARGETDURATION).
+	 * This is the maximum duration of any segment in the playlist.
+	 * For live streams, the HLS spec recommends starting playback at 3×targetDuration from the live edge.
+	 */
+	async getTargetDuration(): Promise<number> {
+		await this.getInput();
+		return this._currentMediaPlaylist?.targetDuration ?? 0;
 	}
 
 	/**
